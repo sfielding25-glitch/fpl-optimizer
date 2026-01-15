@@ -503,7 +503,7 @@ bench_weight = float(st.session_state.bench_weight)
 fixture_horizon = int(st.session_state.fixture_horizon)
 n_matches_std = int(st.session_state.n_matches_std)
 
-# ---- Separate GW for stats vs fixtures/picks ----
+# ---- Separate GW for stats vs fixtures ----
 gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures start at gw_stats + 1
 
 fixtures = load_fixtures()
@@ -515,8 +515,6 @@ st.caption(
     f"Anchor GW (fixtures): **GW{gw_fixtures}** • "
     f"Fixture window: **GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1}**"
 )
-if st.session_state.gw_used_for_picks:
-    st.caption(f"Loaded squad picks from: **GW{st.session_state.gw_used_for_picks}**")
 
 tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
     ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
@@ -526,16 +524,16 @@ tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
 with tab_load:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Load or select your 15-man squad")
-    st.caption("Picks are loaded via the FPL Team ID (Entry ID). If the upcoming GW isn’t available yet, we fallback automatically.")
+    st.subheader("Load your squad via Team ID (Entry ID)")
+    st.caption("Recommended. This pulls your 15 players automatically. If the upcoming GW isn't available yet, the app falls back safely.")
 
     left, right = st.columns([1, 2], gap="large")
 
     with left:
-        st.markdown("### Load via Team ID (Entry ID)")
-        st.caption("The Team ID is a number in the FPL website URL.")
+        st.markdown("### Team ID (Entry ID)")
+        st.caption("Your Team ID is a number in the FPL website URL.")
 
-        with st.expander("How to find your Team ID (Entry ID)", expanded=True):
+        with st.expander("How to find your Team ID (Entry ID)", expanded=False):
             st.markdown(
                 """
 **Method 1 (fastest): copy it from the URL**
@@ -550,10 +548,6 @@ with tab_load:
 **Example**
 - If you see: `.../entry/1234567/event/22/points`
 - Then your Team ID is: **1234567**
-
-**Troubleshooting**
-- Mobile app: open the web version in a browser (or use “share/open in browser”), then copy the URL.
-- Team ID is **numbers only**.
                 """
             )
 
@@ -595,8 +589,8 @@ with tab_load:
             st.error(st.session_state.entry_error)
 
         st.markdown("---")
-        st.markdown("**Manual mode**")
-        st.caption("Use the selector on the right to pick exactly 15.")
+        with st.expander("Manual selection (advanced / optional)", expanded=False):
+            st.caption("If you can’t load by Team ID, you can still build a squad manually (choose exactly 15).")
 
     with right:
         all_labels = elements["name"] + " — " + elements["team_name"] + " (" + elements["position"] + ")"
@@ -607,24 +601,28 @@ with tab_load:
         if st.session_state.squad_ids:
             default_selected_labels = [id_to_label[i] for i in st.session_state.squad_ids if i in id_to_label]
 
+        # If we have prefilled IDs from Team ID, we still show the selector (readable + editable),
+        # but it's now "optional" since the main flow is load-by-ID.
         selected = st.multiselect(
-            "Search and select players (choose exactly 15)",
+            "Squad players (optional — loaded squads will appear here automatically)",
             options=all_labels.tolist(),
             default=default_selected_labels,
         )
 
-        if len(selected) != 15:
-            st.info(f"Select exactly 15 players. Currently selected: {len(selected)}")
-            st.session_state.squad_df = None
+        if len(selected) == 0 and st.session_state.squad_ids:
+            # Shouldn't happen often, but keeps state sane.
+            selected_ids = st.session_state.squad_ids
         else:
-            selected_ids = [label_to_id[s] for s in selected]
+            selected_ids = [label_to_id[s] for s in selected] if selected else (st.session_state.squad_ids or [])
+
+        if len(selected_ids) == 15:
             st.session_state.squad_ids = selected_ids
 
             squad_raw = elements[elements["player_id"].isin(selected_ids)].copy()
             squad = add_fixture_adjusted_xpts(squad_raw, team_diff, risk_mode, n_matches_std=n_matches_std)
             st.session_state.squad_df = squad
 
-            st.success("Squad saved. Head to the Transfers or Optimize tabs.")
+            st.success("Squad loaded and saved. Head to the Transfers or Optimize tabs.")
 
             st.markdown("**Squad preview (Floor / Mean / Ceiling)**")
             st.dataframe(
@@ -636,6 +634,14 @@ with tab_load:
                 use_container_width=True,
                 hide_index=True
             )
+        else:
+            # If user hasn't loaded yet, keep it clean.
+            if st.session_state.squad_ids and len(st.session_state.squad_ids) != 15:
+                st.info("Loaded squad is incomplete. Try re-loading via Team ID.")
+            elif selected and len(selected_ids) != 15:
+                st.info(f"Manual selection requires exactly 15 players. Currently selected: {len(selected_ids)}")
+            else:
+                st.session_state.squad_df = None
 
 # -------------------- TAB 2: Transfers --------------------
 with tab_transfers:
@@ -646,7 +652,7 @@ with tab_transfers:
 
     squad = st.session_state.squad_df
     if squad is None or len(squad) == 0:
-        st.info("Load or select a 15-man squad in the **Load team** tab first.")
+        st.info("Load your squad in the **Load team** tab first.")
     else:
         colA, colB, colC = st.columns([1, 1, 2], gap="large")
 
@@ -732,7 +738,7 @@ with tab_opt:
 
     squad = st.session_state.squad_df
     if squad is None or len(squad) == 0:
-        st.info("Load or select a 15-man squad in the **Load team** tab first.")
+        st.info("Load your squad in the **Load team** tab first.")
     else:
         left, right = st.columns([1, 2], gap="large")
 
