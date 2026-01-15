@@ -29,7 +29,9 @@ def load_bootstrap() -> pd.DataFrame:
         "minutes", "transfers_in_event", "transfers_out_event",
     ]
     elements = elements[keep].copy()
-    elements = elements.rename(columns={"team": "team_id", "element_type": "pos_id", "id": "player_id"})
+    elements = elements.rename(
+        columns={"team": "team_id", "element_type": "pos_id", "id": "player_id"}
+    )
     elements["position"] = elements["pos_id"].map(POS_MAP)
     elements = elements.merge(teams, on="team_id", how="left")
     elements["name"] = elements["web_name"].fillna(elements["second_name"])
@@ -62,16 +64,44 @@ def get_gw_stats_and_fixtures() -> tuple[int, int]:
 
 
 @st.cache_data(ttl=60 * 15)
-def load_entry_picks(entry_id: int, gw: int) -> list[int]:
-    url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{gw}/picks/"
-    resp = requests.get(url, timeout=30)
-    if resp.status_code != 200:
-        raise ValueError(f"Could not load team. HTTP {resp.status_code}. Is the team ID correct and public?")
-    data = resp.json()
-    picks = data.get("picks", [])
-    if not picks:
-        raise ValueError("No picks found. This can happen if the season hasn't started or your team is private.")
-    return [int(p["element"]) for p in picks]
+def load_entry_picks_with_fallback(
+    entry_id: int,
+    gw_try_1: int,
+    gw_try_2: int | None = None
+) -> tuple[list[int], int]:
+    """
+    Tries to load a manager's picks for gw_try_1 first, then optionally gw_try_2.
+    Returns (player_ids, gw_used).
+
+    This avoids the common FPL API behavior where the "upcoming" GW endpoint
+    may 404 before picks are available.
+    """
+    def _fetch(gw: int) -> list[int]:
+        url = f"https://fantasy.premierleague.com/api/entry/{int(entry_id)}/event/{int(gw)}/picks/"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        picks = data.get("picks", [])
+        if not picks:
+            raise ValueError("No picks found")
+        return [int(p["element"]) for p in picks]
+
+    try:
+        return _fetch(int(gw_try_1)), int(gw_try_1)
+    except Exception:
+        if gw_try_2 is None:
+            raise ValueError(
+                f"Could not load team for GW{gw_try_1}. "
+                "Double-check Entry ID and that the team is public."
+            )
+        try:
+            return _fetch(int(gw_try_2)), int(gw_try_2)
+        except Exception as e:
+            raise ValueError(
+                f"Could not load team. Tried GW{gw_try_1} and GW{gw_try_2}. "
+                "Double-check Entry ID and that the team is public."
+            ) from e
 
 
 # -------------------- Fixture difficulty (horizon) --------------------
@@ -356,7 +386,7 @@ def suggest_best_transfer_by_lineup(
             (candidates["now_cost"] <= max_buy_cost)
         ].copy()
 
-    # Apply 3-per-team constraint
+        # Apply 3-per-team constraint
         ins = ins[ins["team_id"].apply(lambda tid: counts_after_sell.get(int(tid), 0) + 1 <= 3)]
         if ins.empty:
             continue
@@ -440,6 +470,7 @@ st.session_state.setdefault("squad_ids", None)
 st.session_state.setdefault("squad_df", None)
 st.session_state.setdefault("transfer_df", None)
 st.session_state.setdefault("entry_error", None)
+st.session_state.setdefault("gw_used_for_picks", None)
 
 # Global settings state
 st.session_state.setdefault("risk_mode", "Balanced")
@@ -473,7 +504,7 @@ fixture_horizon = int(st.session_state.fixture_horizon)
 n_matches_std = int(st.session_state.n_matches_std)
 
 # ---- Separate GW for stats vs fixtures/picks ----
-gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures/picks start at gw_stats + 1
+gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures start at gw_stats + 1
 
 fixtures = load_fixtures()
 team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw_fixtures, horizon=fixture_horizon)
@@ -481,9 +512,11 @@ team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw_fixtures, 
 # Global caption (visible above tabs)
 st.caption(
     f"Stats reference: **GW{gw_stats}** (last finished) • "
-    f"Anchor GW (fixtures & picks): **GW{gw_fixtures}** • "
+    f"Anchor GW (fixtures): **GW{gw_fixtures}** • "
     f"Fixture window: **GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1}**"
 )
+if st.session_state.gw_used_for_picks:
+    st.caption(f"Loaded squad picks from: **GW{st.session_state.gw_used_for_picks}**")
 
 tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
     ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
@@ -494,7 +527,7 @@ with tab_load:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
     st.subheader("Load or select your 15-man squad")
-    st.caption("Loads your squad for the upcoming anchor gameweek (shown above).")
+    st.caption("Picks are loaded via the FPL Team ID (Entry ID). If the upcoming GW isn’t available yet, we fallback automatically.")
 
     left, right = st.columns([1, 2], gap="large")
 
@@ -544,7 +577,14 @@ with tab_load:
             try:
                 if not entry_id.strip().isdigit():
                     raise ValueError("Please enter a numeric Team ID (Entry ID).")
-                prefill_ids = load_entry_picks(int(entry_id.strip()), gw_fixtures)
+
+                # Try last finished GW first (usually exists), then upcoming anchor GW
+                prefill_ids, gw_used = load_entry_picks_with_fallback(
+                    int(entry_id.strip()),
+                    gw_try_1=gw_stats,
+                    gw_try_2=gw_fixtures
+                )
+                st.session_state.gw_used_for_picks = gw_used
                 st.session_state.squad_ids = prefill_ids
                 st.session_state.entry_error = None
                 st.session_state.transfer_df = None
