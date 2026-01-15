@@ -356,6 +356,7 @@ def suggest_best_transfer_by_lineup(
             (candidates["now_cost"] <= max_buy_cost)
         ].copy()
 
+    # Apply 3-per-team constraint
         ins = ins[ins["team_id"].apply(lambda tid: counts_after_sell.get(int(tid), 0) + 1 <= 3)]
         if ins.empty:
             continue
@@ -430,57 +431,6 @@ def settings_summary(risk_mode: str, fixture_horizon: int, bench_weight: float, 
     )
 
 
-def settings_drawer(tab_key_prefix: str):
-    """
-    Per-tab drawer that lets you adjust global settings without leaving the tab.
-    Uses separate widget keys and an Apply button to update global settings.
-    """
-    with st.expander("⚙️ Settings drawer (optional)", expanded=False):
-        st.caption("Adjust global settings here and click **Apply** (updates sidebar too).")
-
-        current_risk = st.session_state.get("risk_mode", "Balanced")
-        current_bench = float(st.session_state.get("bench_weight", 0.10))
-        current_horizon = int(st.session_state.get("fixture_horizon", 3))
-        current_vol = int(st.session_state.get("n_matches_std", 6))
-
-        risk = st.selectbox(
-            "Risk mode",
-            ["Safe", "Balanced", "Aggro"],
-            index=["Safe", "Balanced", "Aggro"].index(current_risk),
-            key=f"{tab_key_prefix}_risk_mode",
-        )
-        bench = st.slider(
-            "Bench importance",
-            0.0, 0.3, current_bench, 0.01,
-            key=f"{tab_key_prefix}_bench_weight",
-        )
-        horizon = st.slider(
-            "Fixture horizon (GWs)",
-            1, 6, current_horizon, 1,
-            key=f"{tab_key_prefix}_fixture_horizon",
-        )
-        vol = st.slider(
-            "Volatility lookback (matches)",
-            4, 10, current_vol, 1,
-            key=f"{tab_key_prefix}_n_matches_std",
-        )
-
-        colA, colB = st.columns([1, 2], gap="large")
-        with colA:
-            if st.button("Apply", type="primary", key=f"{tab_key_prefix}_apply_btn"):
-                st.session_state.risk_mode = risk
-                st.session_state.bench_weight = float(bench)
-                st.session_state.fixture_horizon = int(horizon)
-                st.session_state.n_matches_std = int(vol)
-
-                # Clear derived artifacts so we don't show stale results
-                st.session_state.transfer_df = None
-                st.session_state.squad_df = None
-                st.rerun()
-        with colB:
-            st.caption("Applying settings will refresh projections and may require reloading your squad.")
-
-
 # -------------------- UI --------------------
 st.set_page_config(page_title="FPL Lineup Optimizer", page_icon="⚽", layout="wide")
 st.title("⚽ FPL Assistant")
@@ -522,7 +472,7 @@ bench_weight = float(st.session_state.bench_weight)
 fixture_horizon = int(st.session_state.fixture_horizon)
 n_matches_std = int(st.session_state.n_matches_std)
 
-# ---- New: separate GW for stats vs fixtures/picks ----
+# ---- Separate GW for stats vs fixtures/picks ----
 gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures/picks start at gw_stats + 1
 
 fixtures = load_fixtures()
@@ -542,7 +492,6 @@ tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
 # -------------------- TAB 1: Load team --------------------
 with tab_load:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
-    settings_drawer("load")
 
     st.subheader("Load or select your 15-man squad")
     st.caption("Loads your squad for the upcoming anchor gameweek (shown above).")
@@ -595,7 +544,6 @@ with tab_load:
             try:
                 if not entry_id.strip().isdigit():
                     raise ValueError("Please enter a numeric Team ID (Entry ID).")
-                # Picks are loaded for the *anchor* GW (gw_fixtures)
                 prefill_ids = load_entry_picks(int(entry_id.strip()), gw_fixtures)
                 st.session_state.squad_ids = prefill_ids
                 st.session_state.entry_error = None
@@ -652,7 +600,6 @@ with tab_load:
 # -------------------- TAB 2: Transfers --------------------
 with tab_transfers:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
-    settings_drawer("transfers")
 
     st.subheader("Transfer recommendations (lineup-aware)")
     st.caption("Evaluates each 1-transfer move by re-optimizing your XI and captaincy after the transfer.")
@@ -739,7 +686,6 @@ with tab_transfers:
 # -------------------- TAB 3: Optimize & captaincy --------------------
 with tab_opt:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
-    settings_drawer("opt")
 
     st.subheader("Optimize XI, bench, and captaincy")
     st.caption("Picks the best legal XI + bench + captain based on your chosen target (floor/mean/ceiling).")
@@ -819,7 +765,6 @@ with tab_opt:
 # -------------------- TAB 4: Top 10 players --------------------
 with tab_top:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
-    settings_drawer("top")
 
     st.subheader("Top 10 players by expected points")
     st.caption("Shows the 10 players with the highest **mean** expected points (fixture-adjusted) over your selected fixture horizon.")
