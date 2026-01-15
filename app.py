@@ -457,7 +457,11 @@ with st.sidebar:
 gw = get_current_gw()
 fixtures = load_fixtures()
 team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw, horizon=fixture_horizon)
-st.caption(f"Using gameweek **{gw}** • Fixture horizon **{fixture_horizon}** GWs")
+st.caption(
+    f"Anchor gameweek: **GW{gw}** • "
+    f"Fixture window: **GW{gw}–GW{gw + fixture_horizon - 1}**"
+)
+
 
 tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
     ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
