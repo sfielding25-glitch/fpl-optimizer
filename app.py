@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import requests
@@ -153,6 +154,19 @@ def expected_points_v1(row, risk_mode: str) -> float:
     return max(0.0, float(exp))
 
 
+def add_fixture_adjusted_mean_only(df: pd.DataFrame, team_diff_map: dict, risk_mode: str) -> pd.DataFrame:
+    """
+    Fast path: computes ONLY mean expected points (fixture-adjusted).
+    No element-summary calls (so safe to run over all players).
+    """
+    out = df.copy()
+    out["base_xPts"] = out.apply(lambda r: expected_points_v1(r, risk_mode), axis=1)
+    out["avg_fixture_difficulty"] = out["team_id"].map(team_diff_map)
+    out["fixture_mult"] = out["avg_fixture_difficulty"].apply(fixture_multiplier)
+    out["exp_points"] = out["base_xPts"] * out["fixture_mult"]
+    return out
+
+
 # -------------------- Floor / Ceiling via recent history volatility --------------------
 @st.cache_data(ttl=60 * 60)
 def load_element_summary(player_id: int) -> dict:
@@ -196,23 +210,15 @@ def add_fixture_adjusted_xpts(
 ) -> pd.DataFrame:
     """
     Adds columns:
-      - base_xPts (pre-fixtures mean)
-      - avg_fixture_difficulty, fixture_mult
       - exp_points (mean fixture-adjusted)
-      - recent_std_pts, floor_points, ceiling_points
+      - floor_points / ceiling_points using volatility proxy from recent match points
     """
-    out = df.copy()
-
-    out["base_xPts"] = out.apply(lambda r: expected_points_v1(r, risk_mode), axis=1)
-    out["avg_fixture_difficulty"] = out["team_id"].map(team_diff_map)
-    out["fixture_mult"] = out["avg_fixture_difficulty"].apply(fixture_multiplier)
-    out["exp_points"] = out["base_xPts"] * out["fixture_mult"]
+    out = add_fixture_adjusted_mean_only(df, team_diff_map, risk_mode)
 
     out["recent_std_pts"] = out["player_id"].apply(lambda pid: recent_points_std(pid, n_matches=n_matches_std))
     fc = out.apply(lambda r: floor_ceiling_from_mean(r["exp_points"], r["recent_std_pts"]), axis=1)
     out["floor_points"] = [x[0] for x in fc]
     out["ceiling_points"] = [x[1] for x in fc]
-
     return out
 
 
@@ -418,7 +424,7 @@ def style_transfer_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
 
 # -------------------- UI --------------------
 st.set_page_config(page_title="FPL Lineup Optimizer", page_icon="⚽", layout="wide")
-st.title("⚽ Whiskeybizness Lineup Optimizer")
+st.title("⚽ FPL Management Assistant")
 
 # Shared state
 if "squad_ids" not in st.session_state:
@@ -434,7 +440,7 @@ elements = load_bootstrap()
 
 with st.sidebar:
     st.header("Global settings")
-    st.caption("These affect projections everywhere (transfers + optimize).")
+    st.caption("These affect projections everywhere (transfers + optimize + top players).")
 
     risk_mode = st.selectbox("Risk mode", ["Safe", "Balanced", "Aggro"], index=1)
     st.caption("Safe favors reliability; Aggro favors upside.")
@@ -446,33 +452,72 @@ with st.sidebar:
     st.caption("How many upcoming gameweeks to average fixture difficulty across.")
 
     n_matches_std = st.slider("Volatility lookback (matches)", 4, 10, 6, 1)
-    st.caption("How many recent matches to estimate volatility for floor/ceiling.")
+    st.caption("Used for floor/ceiling. Larger = steadier estimate.")
 
 gw = get_current_gw()
 fixtures = load_fixtures()
 team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw, horizon=fixture_horizon)
 st.caption(f"Using gameweek **{gw}** • Fixture horizon **{fixture_horizon}** GWs")
 
-tab_load, tab_transfers, tab_opt = st.tabs(
-    ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy"]
+tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
+    ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
 )
 
 # -------------------- TAB 1: Load team --------------------
 with tab_load:
     st.subheader("Load or select your 15-man squad")
-    st.caption("Load your current squad using your FPL Team ID (entry id), or manually pick 15 players.")
+    st.caption("Load your current squad using your FPL Team ID (Entry ID), or manually pick 15 players.")
 
     left, right = st.columns([1, 2], gap="large")
 
     with left:
-        st.markdown("**Load via FPL Team ID**")
-        st.caption("Find it in your FPL URL (…/entry/123456/…).")
+        st.markdown("### Load via Team ID (Entry ID)")
+        st.caption("The Team ID is a number in the FPL website URL.")
 
-        entry_id = st.text_input("FPL Team ID (entry id)", value="")
-        if st.button("⬇️ Load my squad", type="primary"):
+        with st.expander("How to find your Team ID (Entry ID)", expanded=True):
+            st.markdown(
+                """
+**Method 1 (fastest): copy it from the URL**
+1. Open the Fantasy Premier League website and log in.
+2. Go to **Points** (or **Pick Team**) for your squad.
+3. Look at your browser address bar — your URL will include `/entry/<NUMBER>/`.
+
+**Generic formats**
+- `https://fantasy.premierleague.com/entry/<ENTRY_ID>/event/<GW>/points`
+- `https://fantasy.premierleague.com/entry/<ENTRY_ID>/`
+
+**Example**
+- If you see: `.../entry/1234567/event/22/points`
+- Then your Team ID is: **1234567**
+
+**Troubleshooting**
+- Mobile app: open the web version in a browser (or use “share/open in browser”), then copy the URL.
+- Team ID is **numbers only**.
+                """
+            )
+
+        # Entry ID input (can be overwritten by URL extraction below)
+        entry_id = st.text_input("FPL Team ID (Entry ID)", value="", placeholder="e.g., 1234567")
+
+        # URL auto-extract
+        url_paste = st.text_input(
+            "Or paste your FPL URL here (optional)",
+            value="",
+            placeholder="https://fantasy.premierleague.com/entry/1234567/event/22/points"
+        )
+        if url_paste.strip():
+            m = re.search(r"/entry/(\d+)", url_paste)
+            if m:
+                entry_id = m.group(1)
+                st.success(f"Found Team ID: {entry_id}")
+            else:
+                st.warning("Couldn’t find `/entry/<number>/` in that URL. Try copying the Points page URL.")
+
+        load_team = st.button("⬇️ Load my squad", type="primary")
+        if load_team:
             try:
                 if not entry_id.strip().isdigit():
-                    raise ValueError("Please enter a numeric Team ID (entry id).")
+                    raise ValueError("Please enter a numeric Team ID (Entry ID).")
                 prefill_ids = load_entry_picks(int(entry_id.strip()), gw)
                 st.session_state.squad_ids = prefill_ids
                 st.session_state.entry_error = None
@@ -557,7 +602,6 @@ with tab_transfers:
         points_col = resolve_points_col(optimize_target, risk_mode)
         lens_name = friendly_lens(points_col)
 
-        # ✅ Descriptor line requested
         st.caption(
             f"**Incremental expected points** = (optimized team after transfer) − (current optimized team), "
             f"using the **{lens_name}** lens."
@@ -565,7 +609,6 @@ with tab_transfers:
 
         run = st.button("🔎 Find best transfer", type="primary")
         if run:
-            # Candidate pool: top by PPG to keep element-summary calls reasonable
             candidate_pool = elements.sort_values("points_per_game", ascending=False).head(candidate_pool_size).copy()
             all_with_xp = add_fixture_adjusted_xpts(candidate_pool, team_diff, risk_mode, n_matches_std=n_matches_std)
 
@@ -596,7 +639,6 @@ with tab_transfers:
                     f"New captain: {best['new_captain']} • New vice: {best['new_vice']}"
                 )
 
-                # ✅ Hide "lens" column in table (since it's in subtitle)
                 display_cols = [
                     "sell_player", "sell_team", "sell_pos", "sell_cost_£m",
                     "buy_player", "buy_team", "buy_cost_£m",
@@ -604,7 +646,6 @@ with tab_transfers:
                     "incremental_xPts",
                     "new_captain", "new_vice"
                 ]
-                # ✅ Round and highlight
                 shown = transfer_df[display_cols].copy()
                 shown["incremental_xPts"] = shown["incremental_xPts"].round(2)
 
@@ -688,3 +729,49 @@ with tab_opt:
             use_container_width=True,
             hide_index=True
         )
+
+# -------------------- TAB 4: Top 10 players --------------------
+with tab_top:
+    st.subheader("Top 10 players by expected points")
+    st.caption("Shows the 10 players with the highest **mean** expected points (fixture-adjusted) over your selected fixture horizon.")
+
+    # Fast computation over all players (mean only)
+    all_mean = add_fixture_adjusted_mean_only(elements, team_diff, risk_mode)
+
+    col1, col2, col3 = st.columns([1, 1, 2], gap="large")
+    with col1:
+        min_minutes = st.slider("Min minutes played", 0, 2000, 0, 100)
+        st.caption("Filter out players with tiny samples (optional).")
+    with col2:
+        only_available = st.checkbox("Only likely available", value=True)
+        st.caption("Removes i/s/u and doubtful players.")
+    with col3:
+        st.caption("Tip: this tab is intentionally fast (no floor/ceiling). Floor/ceiling requires extra match-history fetches.")
+
+    df = all_mean.copy()
+    if min_minutes > 0:
+        df = df[df["minutes"].fillna(0) >= min_minutes]
+
+    if only_available:
+        df = df[~df["status"].isin(["i", "s", "u", "d"])]
+
+    top10 = (
+        df.sort_values("exp_points", ascending=False)
+          .head(10)
+          .copy()
+    )
+
+    top10["cost_£m"] = (top10["now_cost"] / 10.0).round(1)
+    top10["exp_points"] = top10["exp_points"].round(2)
+    top10["avg_fixture_difficulty"] = top10["avg_fixture_difficulty"].round(2)
+    top10["fixture_mult"] = top10["fixture_mult"].round(3)
+
+    st.dataframe(
+        top10[[
+            "name", "team_name", "position", "cost_£m", "status",
+            "avg_fixture_difficulty", "fixture_mult",
+            "exp_points"
+        ]],
+        use_container_width=True,
+        hide_index=True
+    )
