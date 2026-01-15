@@ -46,17 +46,19 @@ def load_fixtures() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60 * 30)
-def get_current_gw() -> int:
+def get_gw_stats_and_fixtures() -> tuple[int, int]:
+    """
+    gw_stats: last FINISHED gameweek id (our 'latest completed reference point')
+    gw_fixtures: gw_stats + 1 (the upcoming GW we should optimize for)
+    """
     data = requests.get(FPL_BOOTSTRAP, timeout=30).json()
-    events = data["events"]
-    current = next((e for e in events if e.get("is_current")), None)
-    if current:
-        return int(current["id"])
-    nxt = next((e for e in events if e.get("is_next")), None)
-    if nxt:
-        return int(nxt["id"])
-    unfinished = next((e for e in events if not e.get("finished")), None)
-    return int(unfinished["id"]) if unfinished else 1
+    events = data.get("events", [])
+
+    finished_ids = [int(e["id"]) for e in events if e.get("finished")]
+    gw_stats = max(finished_ids) if finished_ids else 0
+    gw_fixtures = gw_stats + 1 if gw_stats > 0 else 1  # early season safety
+
+    return gw_stats, gw_fixtures
 
 
 @st.cache_data(ttl=60 * 15)
@@ -157,7 +159,7 @@ def expected_points_v1(row, risk_mode: str) -> float:
 def add_fixture_adjusted_mean_only(df: pd.DataFrame, team_diff_map: dict, risk_mode: str) -> pd.DataFrame:
     """
     Fast path: computes ONLY mean expected points (fixture-adjusted).
-    No element-summary calls (so safe to run over all players).
+    No element-summary calls (safe to run over all players).
     """
     out = df.copy()
     out["base_xPts"] = out.apply(lambda r: expected_points_v1(r, risk_mode), axis=1)
@@ -214,7 +216,6 @@ def add_fixture_adjusted_xpts(
       - floor_points / ceiling_points using volatility proxy from recent match points
     """
     out = add_fixture_adjusted_mean_only(df, team_diff_map, risk_mode)
-
     out["recent_std_pts"] = out["player_id"].apply(lambda pid: recent_points_std(pid, n_matches=n_matches_std))
     fc = out.apply(lambda r: floor_ceiling_from_mean(r["exp_points"], r["recent_std_pts"]), axis=1)
     out["floor_points"] = [x[0] for x in fc]
@@ -329,7 +330,7 @@ def suggest_best_transfer_by_lineup(
     squad = squad.copy().reset_index(drop=True)
     squad_ids = set(squad["player_id"].tolist())
 
-    base_starters, base_bench, base_capt, base_vice = optimize_lineup(
+    base_starters, base_bench, base_capt, _ = optimize_lineup(
         squad, bench_weight=bench_weight, points_col=points_col
     )
     base_score = lineup_objective_score(
@@ -380,16 +381,12 @@ def suggest_best_transfer_by_lineup(
                 "sell_team": outp["team_name"],
                 "sell_pos": out_pos,
                 "sell_cost_£m": out_cost / 10.0,
-
                 "buy_player": inp["name"],
                 "buy_team": inp["team_name"],
                 "buy_cost_£m": int(inp["now_cost"]) / 10.0,
-
                 "bank_used_£m": max(0, (int(inp["now_cost"]) - out_cost) / 10.0),
-
                 "incremental_xPts": inc,
                 "lens": friendly_lens(points_col),
-
                 "new_captain": captain["name"],
                 "new_vice": vice["name"],
             })
@@ -397,19 +394,21 @@ def suggest_best_transfer_by_lineup(
     if not results:
         return pd.DataFrame()
 
-    df = pd.DataFrame(results).sort_values("incremental_xPts", ascending=False).head(top_n_results)
-    return df
+    return (
+        pd.DataFrame(results)
+        .sort_values("incremental_xPts", ascending=False)
+        .head(top_n_results)
+    )
 
 
 def style_transfer_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    # Green for positive, red for negative
     def color_delta(val):
         if pd.isna(val):
             return ""
         if val > 0:
-            return "color: #0f766e; font-weight: 700;"  # teal-ish
+            return "color: #0f766e; font-weight: 700;"
         if val < 0:
-            return "color: #b91c1c; font-weight: 700;"  # red-ish
+            return "color: #b91c1c; font-weight: 700;"
         return "color: #334155;"
 
     styler = df.style.format({
@@ -422,46 +421,119 @@ def style_transfer_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     return styler
 
 
+# -------------------- UI helpers --------------------
+def settings_summary(risk_mode: str, fixture_horizon: int, bench_weight: float, n_matches_std: int):
+    st.info(
+        f"**Settings:** {risk_mode} • Horizon **{fixture_horizon} GW** • "
+        f"Bench **{bench_weight:.2f}** • Volatility **{n_matches_std} matches**\n\n"
+        "👉 Change these in the **sidebar** (they apply everywhere)."
+    )
+
+
+def settings_drawer(tab_key_prefix: str):
+    """
+    Per-tab drawer that lets you adjust global settings without leaving the tab.
+    Uses separate widget keys and an Apply button to update global settings.
+    """
+    with st.expander("⚙️ Settings drawer (optional)", expanded=False):
+        st.caption("Adjust global settings here and click **Apply** (updates sidebar too).")
+
+        current_risk = st.session_state.get("risk_mode", "Balanced")
+        current_bench = float(st.session_state.get("bench_weight", 0.10))
+        current_horizon = int(st.session_state.get("fixture_horizon", 3))
+        current_vol = int(st.session_state.get("n_matches_std", 6))
+
+        risk = st.selectbox(
+            "Risk mode",
+            ["Safe", "Balanced", "Aggro"],
+            index=["Safe", "Balanced", "Aggro"].index(current_risk),
+            key=f"{tab_key_prefix}_risk_mode",
+        )
+        bench = st.slider(
+            "Bench importance",
+            0.0, 0.3, current_bench, 0.01,
+            key=f"{tab_key_prefix}_bench_weight",
+        )
+        horizon = st.slider(
+            "Fixture horizon (GWs)",
+            1, 6, current_horizon, 1,
+            key=f"{tab_key_prefix}_fixture_horizon",
+        )
+        vol = st.slider(
+            "Volatility lookback (matches)",
+            4, 10, current_vol, 1,
+            key=f"{tab_key_prefix}_n_matches_std",
+        )
+
+        colA, colB = st.columns([1, 2], gap="large")
+        with colA:
+            if st.button("Apply", type="primary", key=f"{tab_key_prefix}_apply_btn"):
+                st.session_state.risk_mode = risk
+                st.session_state.bench_weight = float(bench)
+                st.session_state.fixture_horizon = int(horizon)
+                st.session_state.n_matches_std = int(vol)
+
+                # Clear derived artifacts so we don't show stale results
+                st.session_state.transfer_df = None
+                st.session_state.squad_df = None
+                st.rerun()
+        with colB:
+            st.caption("Applying settings will refresh projections and may require reloading your squad.")
+
+
 # -------------------- UI --------------------
 st.set_page_config(page_title="FPL Lineup Optimizer", page_icon="⚽", layout="wide")
 st.title("⚽ FPL Assistant")
 
 # Shared state
-if "squad_ids" not in st.session_state:
-    st.session_state.squad_ids = None
-if "squad_df" not in st.session_state:
-    st.session_state.squad_df = None
-if "transfer_df" not in st.session_state:
-    st.session_state.transfer_df = None
-if "entry_error" not in st.session_state:
-    st.session_state.entry_error = None
+st.session_state.setdefault("squad_ids", None)
+st.session_state.setdefault("squad_df", None)
+st.session_state.setdefault("transfer_df", None)
+st.session_state.setdefault("entry_error", None)
+
+# Global settings state
+st.session_state.setdefault("risk_mode", "Balanced")
+st.session_state.setdefault("bench_weight", 0.10)
+st.session_state.setdefault("fixture_horizon", 3)
+st.session_state.setdefault("n_matches_std", 6)
 
 elements = load_bootstrap()
 
+# Sidebar: Global settings
 with st.sidebar:
     st.header("Global settings")
     st.caption("These affect projections everywhere (transfers + optimize + top players).")
 
-    risk_mode = st.selectbox("Risk mode", ["Safe", "Balanced", "Aggro"], index=1)
+    st.selectbox("Risk mode", ["Safe", "Balanced", "Aggro"], index=1, key="risk_mode")
     st.caption("Safe favors reliability; Aggro favors upside.")
 
-    bench_weight = st.slider("Bench importance", 0.0, 0.3, 0.10, 0.01)
+    st.slider("Bench importance", 0.0, 0.3, 0.10, 0.01, key="bench_weight")
     st.caption("How much bench points matter in the objective score (useful for Bench Boost).")
 
-    fixture_horizon = st.slider("Fixture horizon (GWs)", 1, 6, 3, 1)
+    st.slider("Fixture horizon (GWs)", 1, 6, 3, 1, key="fixture_horizon")
     st.caption("How many upcoming gameweeks to average fixture difficulty across.")
 
-    n_matches_std = st.slider("Volatility lookback (matches)", 4, 10, 6, 1)
+    st.slider("Volatility lookback (matches)", 4, 10, 6, 1, key="n_matches_std")
     st.caption("Used for floor/ceiling. Larger = steadier estimate.")
 
-gw = get_current_gw()
-fixtures = load_fixtures()
-team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw, horizon=fixture_horizon)
-st.caption(
-    f"Anchor gameweek: **GW{gw}** • "
-    f"Fixture window: **GW{gw}–GW{gw + fixture_horizon - 1}**"
-)
+# Pull global settings
+risk_mode = st.session_state.risk_mode
+bench_weight = float(st.session_state.bench_weight)
+fixture_horizon = int(st.session_state.fixture_horizon)
+n_matches_std = int(st.session_state.n_matches_std)
 
+# ---- New: separate GW for stats vs fixtures/picks ----
+gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures/picks start at gw_stats + 1
+
+fixtures = load_fixtures()
+team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw_fixtures, horizon=fixture_horizon)
+
+# Global caption (visible above tabs)
+st.caption(
+    f"Stats reference: **GW{gw_stats}** (last finished) • "
+    f"Anchor GW (fixtures & picks): **GW{gw_fixtures}** • "
+    f"Fixture window: **GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1}**"
+)
 
 tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
     ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
@@ -469,8 +541,11 @@ tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
 
 # -------------------- TAB 1: Load team --------------------
 with tab_load:
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+    settings_drawer("load")
+
     st.subheader("Load or select your 15-man squad")
-    st.caption("Load your current squad using your FPL Team ID (Entry ID), or manually pick 15 players.")
+    st.caption("Loads your squad for the upcoming anchor gameweek (shown above).")
 
     left, right = st.columns([1, 2], gap="large")
 
@@ -500,10 +575,8 @@ with tab_load:
                 """
             )
 
-        # Entry ID input (can be overwritten by URL extraction below)
         entry_id = st.text_input("FPL Team ID (Entry ID)", value="", placeholder="e.g., 1234567")
 
-        # URL auto-extract
         url_paste = st.text_input(
             "Or paste your FPL URL here (optional)",
             value="",
@@ -522,7 +595,8 @@ with tab_load:
             try:
                 if not entry_id.strip().isdigit():
                     raise ValueError("Please enter a numeric Team ID (Entry ID).")
-                prefill_ids = load_entry_picks(int(entry_id.strip()), gw)
+                # Picks are loaded for the *anchor* GW (gw_fixtures)
+                prefill_ids = load_entry_picks(int(entry_id.strip()), gw_fixtures)
                 st.session_state.squad_ids = prefill_ids
                 st.session_state.entry_error = None
                 st.session_state.transfer_df = None
@@ -577,6 +651,9 @@ with tab_load:
 
 # -------------------- TAB 2: Transfers --------------------
 with tab_transfers:
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+    settings_drawer("transfers")
+
     st.subheader("Transfer recommendations (lineup-aware)")
     st.caption("Evaluates each 1-transfer move by re-optimizing your XI and captaincy after the transfer.")
 
@@ -661,6 +738,9 @@ with tab_transfers:
 
 # -------------------- TAB 3: Optimize & captaincy --------------------
 with tab_opt:
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+    settings_drawer("opt")
+
     st.subheader("Optimize XI, bench, and captaincy")
     st.caption("Picks the best legal XI + bench + captain based on your chosen target (floor/mean/ceiling).")
 
@@ -684,7 +764,9 @@ with tab_opt:
             do_opt = st.button("🚀 Optimize lineup", type="primary")
 
         if do_opt:
-            starters, bench, captain, vice = optimize_lineup(squad, bench_weight=bench_weight, points_col=points_col_opt)
+            starters, bench, captain, vice = optimize_lineup(
+                squad, bench_weight=bench_weight, points_col=points_col_opt
+            )
 
             starter_points = float(starters[points_col_opt].sum())
             bench_points = float(bench[points_col_opt].sum())
@@ -736,10 +818,12 @@ with tab_opt:
 
 # -------------------- TAB 4: Top 10 players --------------------
 with tab_top:
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+    settings_drawer("top")
+
     st.subheader("Top 10 players by expected points")
     st.caption("Shows the 10 players with the highest **mean** expected points (fixture-adjusted) over your selected fixture horizon.")
 
-    # Fast computation over all players (mean only)
     all_mean = add_fixture_adjusted_mean_only(elements, team_diff, risk_mode)
 
     col1, col2, col3 = st.columns([1, 1, 2], gap="large")
@@ -759,11 +843,7 @@ with tab_top:
     if only_available:
         df = df[~df["status"].isin(["i", "s", "u", "d"])]
 
-    top10 = (
-        df.sort_values("exp_points", ascending=False)
-          .head(10)
-          .copy()
-    )
+    top10 = df.sort_values("exp_points", ascending=False).head(10).copy()
 
     top10["cost_£m"] = (top10["now_cost"] / 10.0).round(1)
     top10["exp_points"] = top10["exp_points"].round(2)
