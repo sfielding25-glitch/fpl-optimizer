@@ -106,10 +106,31 @@ def load_entry_picks_with_fallback(
 
 # -------------------- Fixture difficulty (horizon) --------------------
 def fixture_multiplier(avg_difficulty: float) -> float:
-    """Difficulty 1..5 -> multiplier about 1.12..0.88."""
+    """
+    Difficulty is 1 (easy) to 5 (hard).
+
+    We keep a linear base around 3, but add a gentle nonlinear kicker so
+    extremes (1 and 5) matter more without destabilizing the mid-range.
+
+    Linear base (same as before): 0.06 per difficulty step.
+    Nonlinear kicker: pushes 1/5 further than 2/4, capped for stability.
+    """
     if avg_difficulty is None or pd.isna(avg_difficulty):
         return 1.0
-    return 1.00 + (3.0 - float(avg_difficulty)) * 0.06
+
+    d = float(avg_difficulty)
+    x = (3.0 - d)  # + for easier, - for harder
+
+    # Base linear behavior (previous model)
+    mult = 1.0 + 0.06 * x
+
+    # Gentle nonlinear kicker: grows with distance from 3
+    # Keeps 2/4 modest, makes 1/5 more pronounced
+    mult += 0.015 * (abs(x) ** 2) * (1 if x >= 0 else -1)
+
+    # Safety clamp to preserve stability
+    return float(min(1.18, max(0.82, mult)))
+
 
 
 def team_fixture_difficulty_map_horizon(fixtures_df: pd.DataFrame, gw_start: int, horizon: int) -> dict:
