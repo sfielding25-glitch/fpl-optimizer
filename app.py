@@ -10,7 +10,7 @@ FPL_FIXTURES = "https://fantasy.premierleague.com/api/fixtures/"
 FPL_ELEMENT_SUMMARY = "https://fantasy.premierleague.com/api/element-summary/{player_id}/"
 
 POS_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
-
+POS_ORDER = ["GK", "DEF", "MID", "FWD"]
 
 # -------------------- Data loaders --------------------
 @st.cache_data(ttl=60 * 60)
@@ -517,7 +517,7 @@ st.caption(
 )
 
 tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
-    ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top 10 players"]
+    ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top Players"]
 )
 
 # -------------------- TAB 1: Load team --------------------
@@ -588,43 +588,31 @@ with tab_load:
         if st.session_state.entry_error:
             st.error(st.session_state.entry_error)
 
-        st.markdown("---")
-        with st.expander("Manual selection (advanced / optional)", expanded=False):
-            st.caption("If you can’t load by Team ID, you can still build a squad manually (choose exactly 15).")
-
     with right:
         all_labels = elements["name"] + " — " + elements["team_name"] + " (" + elements["position"] + ")"
-        label_to_id = dict(zip(all_labels, elements["player_id"]))
         id_to_label = dict(zip(elements["player_id"], all_labels))
+        label_to_id = dict(zip(all_labels, elements["player_id"]))
 
         default_selected_labels = []
         if st.session_state.squad_ids:
             default_selected_labels = [id_to_label[i] for i in st.session_state.squad_ids if i in id_to_label]
 
-        # If we have prefilled IDs from Team ID, we still show the selector (readable + editable),
-        # but it's now "optional" since the main flow is load-by-ID.
         selected = st.multiselect(
-            "Squad players (optional — loaded squads will appear here automatically)",
+            "Squad (auto-loaded after you enter Team ID)",
             options=all_labels.tolist(),
             default=default_selected_labels,
+            help="If you loaded your Team ID successfully, your 15 players will appear here automatically.",
         )
 
-        if len(selected) == 0 and st.session_state.squad_ids:
-            # Shouldn't happen often, but keeps state sane.
-            selected_ids = st.session_state.squad_ids
-        else:
-            selected_ids = [label_to_id[s] for s in selected] if selected else (st.session_state.squad_ids or [])
+        selected_ids = [label_to_id[s] for s in selected] if selected else (st.session_state.squad_ids or [])
 
         if len(selected_ids) == 15:
             st.session_state.squad_ids = selected_ids
-
             squad_raw = elements[elements["player_id"].isin(selected_ids)].copy()
             squad = add_fixture_adjusted_xpts(squad_raw, team_diff, risk_mode, n_matches_std=n_matches_std)
             st.session_state.squad_df = squad
 
             st.success("Squad loaded and saved. Head to the Transfers or Optimize tabs.")
-
-            st.markdown("**Squad preview (Floor / Mean / Ceiling)**")
             st.dataframe(
                 squad[[
                     "name", "team_name", "position", "now_cost", "status",
@@ -635,13 +623,13 @@ with tab_load:
                 hide_index=True
             )
         else:
-            # If user hasn't loaded yet, keep it clean.
+            st.session_state.squad_df = None
             if st.session_state.squad_ids and len(st.session_state.squad_ids) != 15:
                 st.info("Loaded squad is incomplete. Try re-loading via Team ID.")
             elif selected and len(selected_ids) != 15:
-                st.info(f"Manual selection requires exactly 15 players. Currently selected: {len(selected_ids)}")
+                st.info(f"Squad must contain exactly 15 players. Currently: {len(selected_ids)}")
             else:
-                st.session_state.squad_df = None
+                st.info("Enter your Team ID and click **Load my squad** to populate your 15 players.")
 
 # -------------------- TAB 2: Transfers --------------------
 with tab_transfers:
@@ -808,13 +796,17 @@ with tab_opt:
             hide_index=True
         )
 
-# -------------------- TAB 4: Top 10 players --------------------
+# -------------------- TAB 4: Top Players (by position) --------------------
 with tab_top:
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Top 10 players by expected points")
-    st.caption("Shows the 10 players with the highest **mean** expected points (fixture-adjusted) over your selected fixture horizon.")
+    st.subheader("Top Players (by position)")
+    st.caption(
+        "Shows the top players **by position** using **mean** expected points (fixture-adjusted) "
+        "over your selected fixture horizon. This tab is fast (no floor/ceiling)."
+    )
 
+    # Keeping this fast: mean-only over full player pool
     all_mean = add_fixture_adjusted_mean_only(elements, team_diff, risk_mode)
 
     col1, col2, col3 = st.columns([1, 1, 2], gap="large")
@@ -825,7 +817,8 @@ with tab_top:
         only_available = st.checkbox("Only likely available", value=True)
         st.caption("Removes i/s/u and doubtful players.")
     with col3:
-        st.caption("Tip: this tab is intentionally fast (no floor/ceiling). Floor/ceiling requires extra match-history fetches.")
+        per_pos_n = st.slider("How many per position", 5, 10, 5, 1)
+        st.caption("Top N for each of GK/DEF/MID/FWD. 5 is usually plenty and keeps it readable.")
 
     df = all_mean.copy()
     if min_minutes > 0:
@@ -834,19 +827,25 @@ with tab_top:
     if only_available:
         df = df[~df["status"].isin(["i", "s", "u", "d"])]
 
-    top10 = df.sort_values("exp_points", ascending=False).head(10).copy()
+    df["cost_£m"] = (df["now_cost"] / 10.0).round(1)
+    df["exp_points"] = df["exp_points"].round(2)
+    df["avg_fixture_difficulty"] = df["avg_fixture_difficulty"].round(2)
+    df["fixture_mult"] = df["fixture_mult"].round(3)
 
-    top10["cost_£m"] = (top10["now_cost"] / 10.0).round(1)
-    top10["exp_points"] = top10["exp_points"].round(2)
-    top10["avg_fixture_difficulty"] = top10["avg_fixture_difficulty"].round(2)
-    top10["fixture_mult"] = top10["fixture_mult"].round(3)
+    # Render per-position tables
+    for pos in POS_ORDER:
+        sub = df[df["position"] == pos].sort_values("exp_points", ascending=False).head(per_pos_n).copy()
+        st.markdown(f"### {pos}")
+        if sub.empty:
+            st.info("No players matched your filters.")
+            continue
 
-    st.dataframe(
-        top10[[
-            "name", "team_name", "position", "cost_£m", "status",
-            "avg_fixture_difficulty", "fixture_mult",
-            "exp_points"
-        ]],
-        use_container_width=True,
-        hide_index=True
-    )
+        st.dataframe(
+            sub[[
+                "name", "team_name", "position", "cost_£m", "status",
+                "avg_fixture_difficulty", "fixture_mult",
+                "exp_points"
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
