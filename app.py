@@ -133,31 +133,43 @@ def fixture_multiplier(avg_difficulty: float) -> float:
 
 
 
-def team_fixture_difficulty_map_horizon(fixtures_df: pd.DataFrame, gw_start: int, horizon: int) -> dict:
+def team_fixture_context_horizon(
+    fixtures_df: pd.DataFrame, gw_start: int, horizon: int
+) -> tuple[dict, dict, dict]:
     """
-    team_id -> avg difficulty across gw_start..gw_start+horizon-1.
-    Handles DGWs by averaging within each GW first.
+    Returns:
+      - avg difficulty per team across gw_start..gw_start+horizon-1 (DGWs averaged per GW first)
+      - home_ratio per team across the horizon (0..1)
+      - fixture_count per team across the horizon
     """
     if fixtures_df.empty:
-        return {}
+        return {}, {}, {}
 
     gws = list(range(int(gw_start), int(gw_start) + int(horizon)))
     f = fixtures_df[fixtures_df["event"].isin(gws)].copy()
     if f.empty:
-        return {}
+        return {}, {}, {}
 
     home = f[["event", "team_h", "team_h_difficulty"]].rename(
         columns={"team_h": "team_id", "team_h_difficulty": "difficulty"}
     )
+    home["is_home"] = 1
     away = f[["event", "team_a", "team_a_difficulty"]].rename(
         columns={"team_a": "team_id", "team_a_difficulty": "difficulty"}
     )
+    away["is_home"] = 0
 
     all_rows = pd.concat([home, away], ignore_index=True)
 
+    # Difficulty: average within each GW first (DGW-safe)
     per_gw = all_rows.groupby(["team_id", "event"])["difficulty"].mean().reset_index()
     horizon_avg = per_gw.groupby("team_id")["difficulty"].mean().to_dict()
-    return horizon_avg
+
+    # Home/away ratio and fixture counts (DGWs count as multiple fixtures)
+    home_ratio = all_rows.groupby("team_id")["is_home"].mean().to_dict()
+    fixture_count = all_rows.groupby("team_id")["is_home"].count().to_dict()
+
+    return horizon_avg, home_ratio, fixture_count
 
 
 # -------------------- Expected points (mean) --------------------
@@ -184,17 +196,19 @@ def expected_points_v1(row, risk_mode: str) -> float:
     if risk_mode == "Safe":
         chance_weight = 1.2
         minutes_weight = 1.2
-        form_weight = 0.10
+        form_weight = 0.25
     elif risk_mode == "Aggro":
         chance_weight = 0.8
         minutes_weight = 0.9
-        form_weight = 0.20
+        form_weight = 0.40
     else:
         chance_weight = 1.0
         minutes_weight = 1.0
-        form_weight = 0.15
+        form_weight = 0.32
 
-    exp = ppg + form_weight * form
+    # Blend long-run PPG with recent form (form is last ~5)
+    base = (1.0 - form_weight) * ppg + form_weight * form
+    exp = base
     exp *= (chance ** chance_weight)
     exp *= (minutes_factor ** minutes_weight)
 
@@ -207,7 +221,12 @@ def expected_points_v1(row, risk_mode: str) -> float:
     return max(0.0, float(exp))
 
 
-def add_fixture_adjusted_mean_only(df: pd.DataFrame, team_diff_map: dict, risk_mode: str) -> pd.DataFrame:
+def add_fixture_adjusted_mean_only(
+    df: pd.DataFrame,
+    team_diff_map: dict,
+    team_home_ratio: dict,
+    risk_mode: str,
+) -> pd.DataFrame:
     """
     Fast path: computes ONLY mean expected points (fixture-adjusted).
     No element-summary calls (safe to run over all players).
@@ -216,7 +235,13 @@ def add_fixture_adjusted_mean_only(df: pd.DataFrame, team_diff_map: dict, risk_m
     out["base_xPts"] = out.apply(lambda r: expected_points_v1(r, risk_mode), axis=1)
     out["avg_fixture_difficulty"] = out["team_id"].map(team_diff_map)
     out["fixture_mult"] = out["avg_fixture_difficulty"].apply(fixture_multiplier)
-    out["exp_points"] = out["base_xPts"] * out["fixture_mult"]
+    # Small home/away balance adjustment (conservative)
+    out["home_ratio"] = out["team_id"].map(team_home_ratio)
+    out["home_ratio"] = out["home_ratio"].fillna(0.5)
+    out["home_mult"] = 1.0 + 0.04 * ((out["home_ratio"] - 0.5) * 2.0)
+    out["home_mult"] = out["home_mult"].clip(0.96, 1.04)
+
+    out["exp_points"] = out["base_xPts"] * out["fixture_mult"] * out["home_mult"]
     return out
 
 
@@ -258,6 +283,7 @@ def floor_ceiling_from_mean(mean_xpts: float, std_points: float) -> tuple[float,
 def add_fixture_adjusted_xpts(
     df: pd.DataFrame,
     team_diff_map: dict,
+    team_home_ratio: dict,
     risk_mode: str,
     n_matches_std: int = 6
 ) -> pd.DataFrame:
@@ -266,7 +292,7 @@ def add_fixture_adjusted_xpts(
       - exp_points (mean fixture-adjusted)
       - floor_points / ceiling_points using volatility proxy from recent match points
     """
-    out = add_fixture_adjusted_mean_only(df, team_diff_map, risk_mode)
+    out = add_fixture_adjusted_mean_only(df, team_diff_map, team_home_ratio, risk_mode)
     out["recent_std_pts"] = out["player_id"].apply(lambda pid: recent_points_std(pid, n_matches=n_matches_std))
     fc = out.apply(lambda r: floor_ceiling_from_mean(r["exp_points"], r["recent_std_pts"]), axis=1)
     out["floor_points"] = [x[0] for x in fc]
@@ -568,7 +594,9 @@ n_matches_std = int(st.session_state.n_matches_std)
 gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures start at gw_stats + 1
 
 fixtures = load_fixtures()
-team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw_fixtures, horizon=fixture_horizon)
+team_diff, team_home_ratio, team_fixture_count = team_fixture_context_horizon(
+    fixtures, gw_start=gw_fixtures, horizon=fixture_horizon
+)
 
 # Global caption (visible above stepper)
 st.caption(
@@ -578,7 +606,7 @@ st.caption(
 
 step = st.radio(
     "Workflow",
-    ["1. Load team", "2. Transfers", "3. Optimize", "4. Top players"],
+    ["1. Load team", "2. Transfers", "3. Optimize", "4. Top players", "5. Assumptions"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -673,7 +701,9 @@ if step == "1. Load team":
         if len(selected_ids) == 15:
             st.session_state.squad_ids = selected_ids
             squad_raw = elements[elements["player_id"].isin(selected_ids)].copy()
-            squad = add_fixture_adjusted_xpts(squad_raw, team_diff, risk_mode, n_matches_std=n_matches_std)
+            squad = add_fixture_adjusted_xpts(
+                squad_raw, team_diff, team_home_ratio, risk_mode, n_matches_std=n_matches_std
+            )
             st.session_state.squad_df = squad
             st.success("Squad loaded. Move to Transfers or Optimize.")
             st.dataframe(
@@ -737,7 +767,9 @@ if step == "2. Transfers":
         run = st.button("Find best transfer", type="primary")
         if run:
             candidate_pool = elements.sort_values("points_per_game", ascending=False).head(candidate_pool_size).copy()
-            all_with_xp = add_fixture_adjusted_xpts(candidate_pool, team_diff, risk_mode, n_matches_std=n_matches_std)
+            all_with_xp = add_fixture_adjusted_xpts(
+                candidate_pool, team_diff, team_home_ratio, risk_mode, n_matches_std=n_matches_std
+            )
 
             bank_cost_tenths = int(round(bank_m * 10))
             transfer_df = suggest_best_transfer_by_lineup(
@@ -873,7 +905,7 @@ if step == "4. Top players":
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Keeping this fast: mean-only over full player pool
-    all_mean = add_fixture_adjusted_mean_only(elements, team_diff, risk_mode)
+    all_mean = add_fixture_adjusted_mean_only(elements, team_diff, team_home_ratio, risk_mode)
 
     col1, col2, col3 = st.columns([1, 1, 2], gap="large")
     with col1:
@@ -915,3 +947,44 @@ if step == "4. Top players":
             use_container_width=True,
             hide_index=True
         )
+
+# -------------------- STEP 5: Assumptions --------------------
+if step == "5. Assumptions":
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Projection assumptions</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="muted">A plain-language summary of how expected points are computed.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### Base expectation (per player)")
+    st.markdown(
+        """
+- **Base points** = blend of long-run PPG and recent form (last ~5 in FPL data).
+- **Risk blend (Safe)**: 75% PPG + 25% Form
+- **Risk blend (Balanced)**: 68% PPG + 32% Form
+- **Risk blend (Aggro)**: 60% PPG + 40% Form
+- **Minutes reliability**: `minutes_factor = clamp(minutes / 1800, 0.3..1.0)`
+- **Availability**: uses FPL chance-of-playing; Safe weights it more, Aggro less.
+- **Status penalty**: i/s/u → ×0.25, d → ×0.75
+        """
+    )
+
+    st.markdown("### Fixture adjustments")
+    st.markdown(
+        f"""
+- **Fixture horizon**: next **{fixture_horizon} GWs** (GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1})
+- **Difficulty multiplier**: linear base around difficulty=3 with a gentle nonlinear kicker (capped `0.82` to `1.18`).
+- **Home/away balance**: small conservative adjustment based on % of home fixtures in the horizon (range `0.96` to `1.04`).
+        """
+    )
+
+    st.markdown("### Default settings")
+    st.markdown(
+        f"""
+- Risk mode: **{risk_mode}**
+- Bench importance: **{bench_weight:.2f}**
+- Volatility lookback: **{n_matches_std} matches**
+        """
+    )
