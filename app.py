@@ -484,7 +484,54 @@ def settings_summary(risk_mode: str, fixture_horizon: int, bench_weight: float, 
 
 # -------------------- UI --------------------
 st.set_page_config(page_title="FPL Lineup Optimizer", page_icon="⚽", layout="wide")
-st.title("⚽ FPL Assistant")
+
+# Minimal, clean styling
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+html, body, [class*="st-"] {
+  font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+h1, h2, h3, h4 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+[data-testid="stMetricValue"] {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.section-card {
+  padding: 1.25rem 1.25rem 1rem 1.25rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.section-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.muted {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.tight hr {
+  margin: 0.75rem 0;
+}
+</style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("FPL Optimizer")
+st.caption("A guided, minimal workflow for squad loading, transfers, and optimization.")
 
 # Shared state
 st.session_state.setdefault("squad_ids", None)
@@ -503,20 +550,13 @@ elements = load_bootstrap()
 
 # Sidebar: Global settings
 with st.sidebar:
-    st.header("Global settings")
-    st.caption("These affect projections everywhere (transfers + optimize + top players).")
+    st.header("Model settings")
+    st.caption("These apply everywhere.")
 
     st.selectbox("Risk mode", ["Safe", "Balanced", "Aggro"], index=1, key="risk_mode")
-    st.caption("Safe favors reliability; Aggro favors upside.")
-
     st.slider("Bench importance", 0.0, 0.3, 0.10, 0.01, key="bench_weight")
-    st.caption("How much bench points matter in the objective score (useful for Bench Boost).")
-
     st.slider("Fixture horizon (GWs)", 1, 6, 3, 1, key="fixture_horizon")
-    st.caption("How many upcoming gameweeks to average fixture difficulty across.")
-
     st.slider("Volatility lookback (matches)", 4, 10, 6, 1, key="n_matches_std")
-    st.caption("Used for floor/ceiling. Larger = steadier estimate.")
 
 # Pull global settings
 risk_mode = st.session_state.risk_mode
@@ -530,34 +570,37 @@ gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures start at gw_stat
 fixtures = load_fixtures()
 team_diff = team_fixture_difficulty_map_horizon(fixtures, gw_start=gw_fixtures, horizon=fixture_horizon)
 
-# Global caption (visible above tabs)
+# Global caption (visible above stepper)
 st.caption(
-    f"Stats reference: **GW{gw_stats}** (last finished) • "
-    f"Anchor GW (fixtures): **GW{gw_fixtures}** • "
+    f"Stats reference: **GW{gw_stats}** • "
     f"Fixture window: **GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1}**"
 )
 
-tab_load, tab_transfers, tab_opt, tab_top = st.tabs(
-    ["🧩 Load team", "🔁 Transfers", "🚀 Optimize & captaincy", "📈 Top Players"]
+step = st.radio(
+    "Workflow",
+    ["1. Load team", "2. Transfers", "3. Optimize", "4. Top players"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-# -------------------- TAB 1: Load team --------------------
-with tab_load:
+# -------------------- STEP 1: Load team --------------------
+if step == "1. Load team":
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Load your squad via Team ID (Entry ID)")
-    st.caption("Recommended. This pulls your 15 players automatically. If the upcoming GW isn't available yet, the app falls back safely.")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Load your squad</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Paste your Entry ID or URL to auto-load your 15 players.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     left, right = st.columns([1, 2], gap="large")
 
     with left:
-        st.markdown("### Team ID (Entry ID)")
-        st.caption("Your Team ID is a number in the FPL website URL.")
+        st.markdown("**Team ID (Entry ID)**")
 
-        with st.expander("How to find your Team ID (Entry ID)", expanded=False):
+        with st.expander("How to find your Team ID", expanded=False):
             st.markdown(
                 """
-**Method 1 (fastest): copy it from the URL**
+**Method 1: copy it from the URL**
 1. Open the Fantasy Premier League website and log in.
 2. Go to **Points** (or **Pick Team**) for your squad.
 3. Look at your browser address bar — your URL will include `/entry/<NUMBER>/`.
@@ -572,7 +615,7 @@ with tab_load:
                 """
             )
 
-        entry_id = st.text_input("FPL Team ID (Entry ID)", value="", placeholder="e.g., 1234567")
+        entry_id = st.text_input("FPL Team ID", value="", placeholder="e.g., 1234567")
 
         url_paste = st.text_input(
             "Or paste your FPL URL here (optional)",
@@ -587,7 +630,7 @@ with tab_load:
             else:
                 st.warning("Couldn’t find `/entry/<number>/` in that URL. Try copying the Points page URL.")
 
-        load_team = st.button("⬇️ Load my squad", type="primary")
+        load_team = st.button("Load my squad", type="primary")
         if load_team:
             try:
                 if not entry_id.strip().isdigit():
@@ -619,10 +662,10 @@ with tab_load:
             default_selected_labels = [id_to_label[i] for i in st.session_state.squad_ids if i in id_to_label]
 
         selected = st.multiselect(
-            "Squad (auto-loaded after you enter Team ID)",
+            "Squad (auto-filled after loading)",
             options=all_labels.tolist(),
             default=default_selected_labels,
-            help="If you loaded your Team ID successfully, your 15 players will appear here automatically.",
+            help="If your Team ID loads, your 15 players will appear here automatically.",
         )
 
         selected_ids = [label_to_id[s] for s in selected] if selected else (st.session_state.squad_ids or [])
@@ -633,8 +676,8 @@ with tab_load:
             squad = add_fixture_adjusted_xpts(squad_raw, team_diff, risk_mode, n_matches_std=n_matches_std)
             st.session_state.squad_df = squad
 
-            st.success("Squad loaded and saved. Head to the Transfers or Optimize tabs.")
-            st.dataframe(
+                st.success("Squad loaded. Move to Transfers or Optimize.")
+                st.dataframe(
                 squad[[
                     "name", "team_name", "position", "now_cost", "status",
                     "avg_fixture_difficulty", "fixture_mult",
@@ -650,18 +693,20 @@ with tab_load:
             elif selected and len(selected_ids) != 15:
                 st.info(f"Squad must contain exactly 15 players. Currently: {len(selected_ids)}")
             else:
-                st.info("Enter your Team ID and click **Load my squad** to populate your 15 players.")
+                st.info("Enter your Team ID and click Load my squad to populate your 15 players.")
 
-# -------------------- TAB 2: Transfers --------------------
-with tab_transfers:
+# -------------------- STEP 2: Transfers --------------------
+if step == "2. Transfers":
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Transfer recommendations (lineup-aware)")
-    st.caption("Evaluates each 1-transfer move by re-optimizing your XI and captaincy after the transfer.")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Transfer recommendations</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Lineup-aware 1-transfer moves, re-optimized after each swap.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     squad = st.session_state.squad_df
     if squad is None or len(squad) == 0:
-        st.info("Load your squad in the **Load team** tab first.")
+        st.info("Load your squad in Step 1 first.")
     else:
         colA, colB, colC = st.columns([1, 1, 2], gap="large")
 
@@ -680,7 +725,7 @@ with tab_transfers:
 
         with colC:
             candidate_pool_size = st.slider("Transfer search breadth", 100, 450, 250, 25, key="cand_pool")
-            st.caption("Limits how many players we consider for transfers (keeps it fast).")
+            st.caption("Limits how many players we consider (keeps it fast).")
 
         points_col = resolve_points_col(optimize_target, risk_mode)
         lens_name = friendly_lens(points_col)
@@ -690,7 +735,7 @@ with tab_transfers:
             f"using the **{lens_name}** lens."
         )
 
-        run = st.button("🔎 Find best transfer", type="primary")
+        run = st.button("Find best transfer", type="primary")
         if run:
             candidate_pool = elements.sort_values("points_per_game", ascending=False).head(candidate_pool_size).copy()
             all_with_xp = add_fixture_adjusted_xpts(candidate_pool, team_diff, risk_mode, n_matches_std=n_matches_std)
@@ -738,16 +783,18 @@ with tab_transfers:
                     hide_index=True
                 )
 
-# -------------------- TAB 3: Optimize & captaincy --------------------
-with tab_opt:
+# -------------------- STEP 3: Optimize & captaincy --------------------
+if step == "3. Optimize":
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Optimize XI, bench, and captaincy")
-    st.caption("Picks the best legal XI + bench + captain based on your chosen target (floor/mean/ceiling).")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Optimize XI + captaincy</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Best legal XI, bench, and captain for your chosen lens.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     squad = st.session_state.squad_df
     if squad is None or len(squad) == 0:
-        st.info("Load your squad in the **Load team** tab first.")
+        st.info("Load your squad in Step 1 first.")
     else:
         left, right = st.columns([1, 2], gap="large")
 
@@ -762,7 +809,7 @@ with tab_opt:
             points_col_opt = resolve_points_col(optimize_target_opt, risk_mode)
             st.caption(f"Optimizer is using **{friendly_lens(points_col_opt)}** (Risk mode: **{risk_mode}**).")
 
-            do_opt = st.button("🚀 Optimize lineup", type="primary")
+            do_opt = st.button("Optimize lineup", type="primary")
 
         if do_opt:
             starters, bench, captain, vice = optimize_lineup(
@@ -774,7 +821,7 @@ with tab_opt:
             total = starter_points + bench_weight * bench_points + float(captain[points_col_opt])
 
             with right:
-                st.markdown("### ✅ Starting XI")
+                st.markdown("### Starting XI")
                 st.dataframe(
                     starters[[
                         "name", "team_name", "position", "status",
@@ -784,7 +831,7 @@ with tab_opt:
                     hide_index=True
                 )
 
-                st.markdown("### 🪑 Bench (best first)")
+                st.markdown("### Bench (best first)")
                 st.dataframe(
                     bench[[
                         "name", "team_name", "position", "status",
@@ -794,19 +841,19 @@ with tab_opt:
                     hide_index=True
                 )
 
-                st.markdown("### 🧢 Captaincy")
+                st.markdown("### Captaincy")
                 st.metric("Captain", f"{captain['name']} ({captain['team_name']})", f"{float(captain[points_col_opt]):.2f}")
                 st.metric("Vice", f"{vice['name']} ({vice['team_name']})", f"{float(vice[points_col_opt]):.2f}")
 
-                st.markdown("### 🧮 Objective score")
+                st.markdown("### Objective score")
                 st.write(f"Starters: **{starter_points:.2f}**")
                 st.write(f"Bench (weighted): **{bench_weight * bench_points:.2f}**")
                 st.write(f"Captain bonus: **{float(captain[points_col_opt]):.2f}**")
                 st.write(f"**Total:** **{total:.2f}**")
 
-        st.markdown("---")
+        st.divider()
         st.markdown("**Squad overview**")
-        st.caption("Sanity-check who is ‘safe’ vs ‘spiky’ and how fixtures are affecting projections.")
+        st.caption("Sanity-check safety vs upside and fixture impact.")
         st.dataframe(
             squad[[
                 "name", "team_name", "position", "now_cost", "status",
@@ -817,15 +864,14 @@ with tab_opt:
             hide_index=True
         )
 
-# -------------------- TAB 4: Top Players (by position) --------------------
-with tab_top:
+# -------------------- STEP 4: Top Players (by position) --------------------
+if step == "4. Top players":
     settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-    st.subheader("Top Players (by position)")
-    st.caption(
-        "Shows the top players **by position** using **mean** expected points (fixture-adjusted) "
-        "over your selected fixture horizon. This tab is fast (no floor/ceiling)."
-    )
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Top players by position</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Mean expected points over your fixture horizon (fast view).</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # Keeping this fast: mean-only over full player pool
     all_mean = add_fixture_adjusted_mean_only(elements, team_diff, risk_mode)
@@ -839,7 +885,7 @@ with tab_top:
         st.caption("Removes i/s/u and doubtful players.")
     with col3:
         per_pos_n = st.slider("How many per position", 5, 10, 5, 1)
-        st.caption("Top N for each of GK/DEF/MID/FWD. 5 is usually plenty and keeps it readable.")
+        st.caption("Top N for each of GK/DEF/MID/FWD.")
 
     df = all_mean.copy()
     if min_minutes > 0:
