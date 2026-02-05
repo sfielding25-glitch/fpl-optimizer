@@ -675,9 +675,8 @@ if step == "1. Load team":
             squad_raw = elements[elements["player_id"].isin(selected_ids)].copy()
             squad = add_fixture_adjusted_xpts(squad_raw, team_diff, risk_mode, n_matches_std=n_matches_std)
             st.session_state.squad_df = squad
-
-                st.success("Squad loaded. Move to Transfers or Optimize.")
-                st.dataframe(
+            st.success("Squad loaded. Move to Transfers or Optimize.")
+            st.dataframe(
                 squad[[
                     "name", "team_name", "position", "now_cost", "status",
                     "avg_fixture_difficulty", "fixture_mult",
