@@ -560,6 +560,7 @@ div[data-testid="stSelectbox"] label,
 div[data-testid="stMultiselect"] label,
 div[data-testid="stSlider"] label,
 div[data-testid="stTextArea"] label {
+  position: static !important;
   display: block;
   margin-bottom: 0.4rem;
   font-weight: 600;
@@ -578,6 +579,29 @@ div[data-testid="stMultiselect"] div[role="combobox"] {
 div[data-testid="stTextInput"] input::placeholder {
   color: #94a3b8;
   opacity: 1;
+}
+
+/* Dark theme adjustments */
+.stApp[data-theme="dark"] div[data-testid="stTextInput"] label,
+.stApp[data-theme="dark"] div[data-testid="stNumberInput"] label,
+.stApp[data-theme="dark"] div[data-testid="stSelectbox"] label,
+.stApp[data-theme="dark"] div[data-testid="stMultiselect"] label,
+.stApp[data-theme="dark"] div[data-testid="stSlider"] label,
+.stApp[data-theme="dark"] div[data-testid="stTextArea"] label {
+  color: #e2e8f0;
+}
+
+.stApp[data-theme="dark"] div[data-testid="stTextInput"] input,
+.stApp[data-theme="dark"] div[data-testid="stNumberInput"] input,
+.stApp[data-theme="dark"] div[data-testid="stSelectbox"] div[role="combobox"],
+.stApp[data-theme="dark"] div[data-testid="stMultiselect"] div[role="combobox"] {
+  background: #0b1220;
+  color: #e2e8f0;
+  border-color: #334155;
+}
+
+.stApp[data-theme="dark"] div[data-testid="stTextInput"] input::placeholder {
+  color: #94a3b8;
 }
 </style>
     """,
