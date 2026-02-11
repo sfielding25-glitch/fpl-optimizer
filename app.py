@@ -1,433 +1,1018 @@
-import os
-import urllib.parse
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
-
-import requests
+import re
 import streamlit as st
+import pandas as pd
+import requests
+from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
+
+# -------------------- Constants --------------------
+FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
+FPL_FIXTURES = "https://fantasy.premierleague.com/api/fixtures/"
+FPL_ELEMENT_SUMMARY = "https://fantasy.premierleague.com/api/element-summary/{player_id}/"
+
+POS_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+POS_ORDER = ["GK", "DEF", "MID", "FWD"]
+
+# -------------------- Data loaders --------------------
+@st.cache_data(ttl=60 * 60)
+def load_bootstrap() -> pd.DataFrame:
+    data = requests.get(FPL_BOOTSTRAP, timeout=30).json()
+    elements = pd.DataFrame(data["elements"])
+    teams = (
+        pd.DataFrame(data["teams"])[["id", "name"]]
+        .rename(columns={"id": "team_id", "name": "team_name"})
+    )
+
+    keep = [
+        "id", "first_name", "second_name", "web_name", "team", "element_type",
+        "now_cost", "status", "chance_of_playing_next_round",
+        "total_points", "form", "points_per_game", "selected_by_percent",
+        "minutes", "transfers_in_event", "transfers_out_event",
+    ]
+    elements = elements[keep].copy()
+    elements = elements.rename(
+        columns={"team": "team_id", "element_type": "pos_id", "id": "player_id"}
+    )
+    elements["position"] = elements["pos_id"].map(POS_MAP)
+    elements = elements.merge(teams, on="team_id", how="left")
+    elements["name"] = elements["web_name"].fillna(elements["second_name"])
+
+    for col in ["form", "points_per_game", "selected_by_percent"]:
+        elements[col] = pd.to_numeric(elements[col], errors="coerce")
+
+    return elements
 
 
-# ----------------------------
-# Keys
-# ----------------------------
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
-OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
-
-TMDB_BASE = "https://api.themoviedb.org/3"
-TMDB_IMG = "https://image.tmdb.org/t/p/w342"
+@st.cache_data(ttl=60 * 60)
+def load_fixtures() -> pd.DataFrame:
+    return pd.DataFrame(requests.get(FPL_FIXTURES, timeout=30).json())
 
 
-# ----------------------------
-# Catalogs (mainstream)
-# ----------------------------
-PROVIDER_NAME_TO_ID = {
-    "Netflix": 8,
-    "Hulu": 15,
-    "Prime Video": 9,
-    "Disney+": 337,
-    "Max": 1899,
-    "Apple TV+": 350,
-    "Paramount+": 531,
-    "Peacock": 386,
-}
+@st.cache_data(ttl=60 * 30)
+def get_gw_stats_and_fixtures() -> tuple[int, int]:
+    """
+    gw_stats: last FINISHED gameweek id (our 'latest completed reference point')
+    gw_fixtures: gw_stats + 1 (the upcoming GW we should optimize for)
+    """
+    data = requests.get(FPL_BOOTSTRAP, timeout=30).json()
+    events = data.get("events", [])
 
-GENRES = {
-    "Action": 28,
-    "Comedy": 35,
-    "Drama": 18,
-    "Horror": 27,
-    "Romance": 10749,
-    "Sci-Fi": 878,
-    "Thriller": 53,
-    "Animation": 16,
-    "Documentary": 99,
-}
+    finished_ids = [int(e["id"]) for e in events if e.get("finished")]
+    gw_stats = max(finished_ids) if finished_ids else 0
+    gw_fixtures = gw_stats + 1 if gw_stats > 0 else 1  # early season safety
 
-REGIONS = ["US", "CA", "GB", "AU"]
+    return gw_stats, gw_fixtures
 
 
-# ----------------------------
-# TMDB / OMDb helpers
-# ----------------------------
-def tmdb_get(path: str, params: Optional[dict] = None) -> dict:
-    if not TMDB_API_KEY:
-        raise RuntimeError("Missing TMDB_API_KEY env var.")
-    params = params or {}
-    params["api_key"] = TMDB_API_KEY
-    r = requests.get(f"{TMDB_BASE}{path}", params=params, timeout=20)
+@st.cache_data(ttl=60 * 15)
+def load_entry_picks_with_fallback(
+    entry_id: int,
+    gw_try_1: int,
+    gw_try_2: int | None = None
+) -> tuple[list[int], int]:
+    """
+    Tries to load a manager's picks for gw_try_1 first, then optionally gw_try_2.
+    Returns (player_ids, gw_used).
+
+    This avoids the common FPL API behavior where the "upcoming" GW endpoint
+    may 404 before picks are available.
+    """
+    def _fetch(gw: int) -> list[int]:
+        url = f"https://fantasy.premierleague.com/api/entry/{int(entry_id)}/event/{int(gw)}/picks/"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        picks = data.get("picks", [])
+        if not picks:
+            raise ValueError("No picks found")
+        return [int(p["element"]) for p in picks]
+
+    try:
+        return _fetch(int(gw_try_1)), int(gw_try_1)
+    except Exception:
+        if gw_try_2 is None:
+            raise ValueError(
+                f"Could not load team for GW{gw_try_1}. "
+                "Double-check Entry ID and that the team is public."
+            )
+        try:
+            return _fetch(int(gw_try_2)), int(gw_try_2)
+        except Exception as e:
+            raise ValueError(
+                f"Could not load team. Tried GW{gw_try_1} and GW{gw_try_2}. "
+                "Double-check Entry ID and that the team is public."
+            ) from e
+
+
+# -------------------- Fixture difficulty (horizon) --------------------
+def fixture_multiplier(avg_difficulty: float) -> float:
+    """
+    Difficulty is 1 (easy) to 5 (hard).
+
+    We keep a linear base around 3, but add a gentle nonlinear kicker so
+    extremes (1 and 5) matter more without destabilizing the mid-range.
+
+    Linear base (same as before): 0.06 per difficulty step.
+    Nonlinear kicker: pushes 1/5 further than 2/4, capped for stability.
+    """
+    if avg_difficulty is None or pd.isna(avg_difficulty):
+        return 1.0
+
+    d = float(avg_difficulty)
+    x = (3.0 - d)  # + for easier, - for harder
+
+    # Base linear behavior (previous model)
+    mult = 1.0 + 0.06 * x
+
+    # Gentle nonlinear kicker: grows with distance from 3
+    # Keeps 2/4 modest, makes 1/5 more pronounced
+    mult += 0.015 * (abs(x) ** 2) * (1 if x >= 0 else -1)
+
+    # Safety clamp to preserve stability
+    return float(min(1.18, max(0.82, mult)))
+
+
+
+def team_fixture_context_horizon(
+    fixtures_df: pd.DataFrame, gw_start: int, horizon: int
+) -> tuple[dict, dict, dict]:
+    """
+    Returns:
+      - avg difficulty per team across gw_start..gw_start+horizon-1 (DGWs averaged per GW first)
+      - home_ratio per team across the horizon (0..1)
+      - fixture_count per team across the horizon
+    """
+    if fixtures_df.empty:
+        return {}, {}, {}
+
+    gws = list(range(int(gw_start), int(gw_start) + int(horizon)))
+    f = fixtures_df[fixtures_df["event"].isin(gws)].copy()
+    if f.empty:
+        return {}, {}, {}
+
+    home = f[["event", "team_h", "team_h_difficulty"]].rename(
+        columns={"team_h": "team_id", "team_h_difficulty": "difficulty"}
+    )
+    home["is_home"] = 1
+    away = f[["event", "team_a", "team_a_difficulty"]].rename(
+        columns={"team_a": "team_id", "team_a_difficulty": "difficulty"}
+    )
+    away["is_home"] = 0
+
+    all_rows = pd.concat([home, away], ignore_index=True)
+
+    # Difficulty: average within each GW first (DGW-safe)
+    per_gw = all_rows.groupby(["team_id", "event"])["difficulty"].mean().reset_index()
+    horizon_avg = per_gw.groupby("team_id")["difficulty"].mean().to_dict()
+
+    # Home/away ratio and fixture counts (DGWs count as multiple fixtures)
+    home_ratio = all_rows.groupby("team_id")["is_home"].mean().to_dict()
+    fixture_count = all_rows.groupby("team_id")["is_home"].count().to_dict()
+
+    return horizon_avg, home_ratio, fixture_count
+
+
+# -------------------- Expected points (mean) --------------------
+def expected_points_v1(row, risk_mode: str) -> float:
+    """
+    Simple heuristic:
+      - Base: points_per_game
+      - + small form boost
+      - × minutes reliability
+      - × availability probability
+      - penalties for injured/suspended
+    """
+    ppg = row["points_per_game"] if pd.notna(row["points_per_game"]) else 0.0
+    form = row["form"] if pd.notna(row["form"]) else 0.0
+
+    mins = row["minutes"] if pd.notna(row["minutes"]) else 0
+    minutes_factor = min(1.0, max(0.3, mins / 1800))  # 1800 mins ~ 20 full matches
+
+    chance = row["chance_of_playing_next_round"]
+    if pd.isna(chance):
+        chance = 100
+    chance = float(chance) / 100.0
+
+    if risk_mode == "Safe":
+        chance_weight = 1.2
+        minutes_weight = 1.2
+        form_weight = 0.25
+    elif risk_mode == "Aggro":
+        chance_weight = 0.8
+        minutes_weight = 0.9
+        form_weight = 0.40
+    else:
+        chance_weight = 1.0
+        minutes_weight = 1.0
+        form_weight = 0.32
+
+    # Blend long-run PPG with recent form (form is last ~5)
+    base = (1.0 - form_weight) * ppg + form_weight * form
+    exp = base
+    exp *= (chance ** chance_weight)
+    exp *= (minutes_factor ** minutes_weight)
+
+    status = str(row["status"])
+    if status in ["i", "s", "u"]:
+        exp *= 0.25
+    elif status == "d":
+        exp *= 0.75
+
+    return max(0.0, float(exp))
+
+
+def add_fixture_adjusted_mean_only(
+    df: pd.DataFrame,
+    team_diff_map: dict,
+    team_home_ratio: dict,
+    risk_mode: str,
+) -> pd.DataFrame:
+    """
+    Fast path: computes ONLY mean expected points (fixture-adjusted).
+    No element-summary calls (safe to run over all players).
+    """
+    out = df.copy()
+    out["base_xPts"] = out.apply(lambda r: expected_points_v1(r, risk_mode), axis=1)
+    out["avg_fixture_difficulty"] = out["team_id"].map(team_diff_map)
+    out["fixture_mult"] = out["avg_fixture_difficulty"].apply(fixture_multiplier)
+    # Small home/away balance adjustment (conservative)
+    out["home_ratio"] = out["team_id"].map(team_home_ratio)
+    out["home_ratio"] = out["home_ratio"].fillna(0.5)
+    out["home_mult"] = 1.0 + 0.04 * ((out["home_ratio"] - 0.5) * 2.0)
+    out["home_mult"] = out["home_mult"].clip(0.96, 1.04)
+
+    out["exp_points"] = out["base_xPts"] * out["fixture_mult"] * out["home_mult"]
+    return out
+
+
+# -------------------- Floor / Ceiling via recent history volatility --------------------
+@st.cache_data(ttl=60 * 60)
+def load_element_summary(player_id: int) -> dict:
+    url = FPL_ELEMENT_SUMMARY.format(player_id=int(player_id))
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-@st.cache_data(ttl=60 * 60)
-def tmdb_search_movie(title: str) -> Optional[dict]:
-    data = tmdb_get("/search/movie", {"query": title, "include_adult": "false"})
-    results = data.get("results", [])
-    return results[0] if results else None
-
-
-@st.cache_data(ttl=60 * 60)
-def tmdb_movie_external_ids(movie_id: int) -> dict:
-    return tmdb_get(f"/movie/{movie_id}/external_ids")
-
-
-@st.cache_data(ttl=60 * 60)
-def tmdb_movie_watch_providers(movie_id: int) -> dict:
-    return tmdb_get(f"/movie/{movie_id}/watch/providers")
-
-
-@st.cache_data(ttl=60 * 30)
-def tmdb_recommendations(movie_id: int, pages: int = 2) -> List[dict]:
-    out: List[dict] = []
-    for p in range(1, pages + 1):
-        data = tmdb_get(f"/movie/{movie_id}/recommendations", {"page": p})
-        out.extend(data.get("results", []))
-    return out
-
-
-@st.cache_data(ttl=60 * 30)
-def tmdb_discover_movies(
-    region: str,
-    genre_id: Optional[int],
-    provider_ids: List[int],
-    pages: int = 3,
-) -> List[dict]:
-    out: List[dict] = []
-    for p in range(1, pages + 1):
-        params = {
-            "sort_by": "popularity.desc",
-            "watch_region": region,
-            "with_watch_providers": "|".join(str(x) for x in provider_ids) if provider_ids else None,
-            "with_genres": str(genre_id) if genre_id else None,
-            "include_adult": "false",
-            "vote_count.gte": 150,
-            "page": p,
-        }
-        params = {k: v for k, v in params.items() if v is not None}
-        data = tmdb_get("/discover/movie", params)
-        out.extend(data.get("results", []))
-    return out
-
-
-def safe_float(x: str) -> Optional[float]:
+def recent_points_std(player_id: int, n_matches: int = 6) -> float:
+    """
+    Std dev of FPL total_points across last n matches with minutes > 0.
+    Used as a volatility proxy.
+    """
     try:
-        x = (x or "").strip()
-        if not x or x == "N/A":
-            return None
-        return float(x)
+        js = load_element_summary(int(player_id))
+        hist = js.get("history", [])
+        if not hist:
+            return 2.5
+        df = pd.DataFrame(hist)
+        df = df[df["minutes"] > 0].tail(n_matches)
+        if len(df) < 3:
+            return 2.5
+        std = float(df["total_points"].std(ddof=0))
+        return max(1.0, min(std, 8.0))
     except Exception:
-        return None
+        return 2.5
 
 
-@st.cache_data(ttl=60 * 60)
-def omdb_lookup(imdb_id: str) -> dict:
-    if not OMDB_API_KEY:
-        return {}
-    r = requests.get(
-        "https://www.omdbapi.com/",
-        params={"apikey": OMDB_API_KEY, "i": imdb_id},
-        timeout=20,
+def floor_ceiling_from_mean(mean_xpts: float, std_points: float) -> tuple[float, float]:
+    floor = max(0.0, float(mean_xpts) - 0.7 * float(std_points))
+    ceil = max(0.0, float(mean_xpts) + 1.2 * float(std_points))
+    return floor, ceil
+
+
+def add_fixture_adjusted_xpts(
+    df: pd.DataFrame,
+    team_diff_map: dict,
+    team_home_ratio: dict,
+    risk_mode: str,
+    n_matches_std: int = 6
+) -> pd.DataFrame:
+    """
+    Adds columns:
+      - exp_points (mean fixture-adjusted)
+      - floor_points / ceiling_points using volatility proxy from recent match points
+    """
+    out = add_fixture_adjusted_mean_only(df, team_diff_map, team_home_ratio, risk_mode)
+    out["recent_std_pts"] = out["player_id"].apply(lambda pid: recent_points_std(pid, n_matches=n_matches_std))
+    fc = out.apply(lambda r: floor_ceiling_from_mean(r["exp_points"], r["recent_std_pts"]), axis=1)
+    out["floor_points"] = [x[0] for x in fc]
+    out["ceiling_points"] = [x[1] for x in fc]
+    return out
+
+
+def resolve_points_col(optimize_target: str, risk_mode: str) -> str:
+    """Maps UI selection to the points column used by optimizer."""
+    if optimize_target == "Floor (safe)":
+        return "floor_points"
+    if optimize_target == "Mean":
+        return "exp_points"
+    if optimize_target == "Ceiling (upside)":
+        return "ceiling_points"
+
+    # Auto
+    if risk_mode == "Safe":
+        return "floor_points"
+    if risk_mode == "Aggro":
+        return "ceiling_points"
+    return "exp_points"
+
+
+def friendly_lens(points_col: str) -> str:
+    return {
+        "floor_points": "Floor (safe)",
+        "exp_points": "Mean",
+        "ceiling_points": "Ceiling (upside)",
+    }.get(points_col, points_col)
+
+
+# -------------------- Optimizer --------------------
+def optimize_lineup(team_df: pd.DataFrame, bench_weight: float = 0.10, points_col: str = "exp_points"):
+    df = team_df.reset_index(drop=True).copy()
+
+    x = [LpVariable(f"start_{i}", cat=LpBinary) for i in range(len(df))]
+    b = [LpVariable(f"bench_{i}", cat=LpBinary) for i in range(len(df))]
+    c = [LpVariable(f"capt_{i}", cat=LpBinary) for i in range(len(df))]
+
+    prob = LpProblem("FPL_Lineup_Optimizer", LpMaximize)
+
+    exp = df[points_col].tolist()
+    prob += (
+        lpSum(x[i] * exp[i] for i in range(len(df)))
+        + bench_weight * lpSum(b[i] * exp[i] for i in range(len(df)))
+        + lpSum(c[i] * exp[i] for i in range(len(df)))  # captain bonus
     )
-    if r.status_code != 200:
-        return {}
-    data = r.json()
-    if data.get("Response") != "True":
-        return {}
-    return data
+
+    prob += lpSum(x) == 11
+    prob += lpSum(b) == 4
+
+    for i in range(len(df)):
+        prob += x[i] + b[i] == 1
+
+    prob += lpSum(c) == 1
+    for i in range(len(df)):
+        prob += c[i] <= x[i]
+
+    def idxs(pos):
+        return [i for i in range(len(df)) if df.loc[i, "position"] == pos]
+
+    gk = idxs("GK")
+    de = idxs("DEF")
+    mi = idxs("MID")
+    fw = idxs("FWD")
+
+    prob += lpSum(x[i] for i in gk) == 1
+    prob += lpSum(x[i] for i in de) >= 3
+    prob += lpSum(x[i] for i in de) <= 5
+    prob += lpSum(x[i] for i in mi) >= 2
+    prob += lpSum(x[i] for i in mi) <= 5
+    prob += lpSum(x[i] for i in fw) >= 1
+    prob += lpSum(x[i] for i in fw) <= 3
+
+    prob.solve(PULP_CBC_CMD(msg=False))
+
+    df["is_start"] = [int(v.value()) for v in x]
+    df["is_bench"] = [int(v.value()) for v in b]
+    df["is_captain"] = [int(v.value()) for v in c]
+
+    starters = df[df["is_start"] == 1].copy().sort_values(["position", points_col], ascending=[True, False])
+    bench = df[df["is_bench"] == 1].copy().sort_values(points_col, ascending=False)
+
+    captain = df[df["is_captain"] == 1].iloc[0]
+    starters_no_c = starters[starters["player_id"] != captain["player_id"]].sort_values(points_col, ascending=False)
+    vice = starters_no_c.iloc[0] if len(starters_no_c) else captain
+
+    return starters, bench, captain, vice
 
 
-def google_link(query: str) -> str:
-    return "https://www.google.com/search?q=" + urllib.parse.quote(query)
+def lineup_objective_score(starters: pd.DataFrame, bench: pd.DataFrame, captain: pd.Series, bench_weight: float, points_col: str) -> float:
+    starter_points = float(starters[points_col].sum())
+    bench_points = float(bench[points_col].sum())
+    return starter_points + bench_weight * bench_points + float(captain[points_col])
 
 
-def extract_provider_ids_for_region(watch_data: dict, region: str) -> Set[int]:
-    region_data = (watch_data.get("results") or {}).get(region) or {}
-    flatrate = region_data.get("flatrate") or []
-    return {p.get("provider_id") for p in flatrate if p.get("provider_id") is not None}
+# -------------------- Transfers (lineup-aware) --------------------
+def suggest_best_transfer_by_lineup(
+    squad: pd.DataFrame,
+    all_players_with_xp: pd.DataFrame,
+    bank_cost_tenths: int,
+    bench_weight: float,
+    points_col: str,
+    max_ins_per_out: int = 20,
+    top_n_results: int = 10
+) -> pd.DataFrame:
+    """
+    Returns top transfers by incremental expected points under the selected lens.
+    incremental_xPts = (optimized team after transfer) - (current optimized team)
+    """
+    squad = squad.copy().reset_index(drop=True)
+    squad_ids = set(squad["player_id"].tolist())
+
+    base_starters, base_bench, base_capt, _ = optimize_lineup(
+        squad, bench_weight=bench_weight, points_col=points_col
+    )
+    base_score = lineup_objective_score(
+        base_starters, base_bench, base_capt, bench_weight, points_col=points_col
+    )
+
+    team_counts = squad["team_id"].value_counts().to_dict()
+    candidates = all_players_with_xp[~all_players_with_xp["player_id"].isin(squad_ids)].copy()
+
+    results = []
+
+    for out_idx, outp in squad.iterrows():
+        out_pos = outp["position"]
+        out_cost = int(outp["now_cost"])
+        out_team = int(outp["team_id"])
+        max_buy_cost = out_cost + int(bank_cost_tenths)
+
+        counts_after_sell = dict(team_counts)
+        counts_after_sell[out_team] = counts_after_sell.get(out_team, 0) - 1
+
+        ins = candidates[
+            (candidates["position"] == out_pos) &
+            (candidates["now_cost"] <= max_buy_cost)
+        ].copy()
+
+        # Apply 3-per-team constraint
+        ins = ins[ins["team_id"].apply(lambda tid: counts_after_sell.get(int(tid), 0) + 1 <= 3)]
+        if ins.empty:
+            continue
+
+        ins = ins.sort_values(points_col, ascending=False).head(max_ins_per_out)
+
+        for _, inp in ins.iterrows():
+            new_squad = squad.copy()
+            new_squad.loc[out_idx] = inp[new_squad.columns].values
+            new_squad = new_squad.reset_index(drop=True)
+
+            starters, bench, captain, vice = optimize_lineup(
+                new_squad, bench_weight=bench_weight, points_col=points_col
+            )
+            new_score = lineup_objective_score(
+                starters, bench, captain, bench_weight, points_col=points_col
+            )
+
+            inc = new_score - base_score
+
+            results.append({
+                "sell_player": outp["name"],
+                "sell_team": outp["team_name"],
+                "sell_pos": out_pos,
+                "sell_cost_£m": out_cost / 10.0,
+                "buy_player": inp["name"],
+                "buy_team": inp["team_name"],
+                "buy_cost_£m": int(inp["now_cost"]) / 10.0,
+                "bank_used_£m": max(0, (int(inp["now_cost"]) - out_cost) / 10.0),
+                "incremental_xPts": inc,
+                "lens": friendly_lens(points_col),
+                "new_captain": captain["name"],
+                "new_vice": vice["name"],
+            })
+
+    if not results:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(results)
+        .sort_values("incremental_xPts", ascending=False)
+        .head(top_n_results)
+    )
 
 
-def movie_available_on_selected_services(movie_id: int, region: str, selected_provider_ids: Set[int]) -> bool:
-    if not selected_provider_ids:
-        return True
-    watch = tmdb_movie_watch_providers(movie_id)
-    ids_here = extract_provider_ids_for_region(watch, region)
-    return len(ids_here & selected_provider_ids) > 0
+def style_transfer_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    def color_delta(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "color: #0f766e; font-weight: 700;"
+        if val < 0:
+            return "color: #b91c1c; font-weight: 700;"
+        return "color: #334155;"
+
+    styler = df.style.format({
+        "sell_cost_£m": "{:.1f}",
+        "buy_cost_£m": "{:.1f}",
+        "bank_used_£m": "{:.1f}",
+        "incremental_xPts": "{:+.2f}",
+    })
+    styler = styler.applymap(color_delta, subset=["incremental_xPts"])
+    return styler
 
 
-# ----------------------------
-# UI components: service pills + tag chips
-# ----------------------------
-def inject_styles() -> None:
-    st.markdown(
-        """
+# -------------------- UI helpers --------------------
+def settings_summary(risk_mode: str, fixture_horizon: int, bench_weight: float, n_matches_std: int):
+    st.info(
+        f"**Settings:** {risk_mode} • Horizon **{fixture_horizon} GW** • "
+        f"Bench **{bench_weight:.2f}** • Volatility **{n_matches_std} matches**\n\n"
+        "👉 Change these in the **sidebar** (they apply everywhere)."
+    )
+
+
+# -------------------- UI --------------------
+st.set_page_config(page_title="FPL Lineup Optimizer", page_icon="⚽", layout="wide")
+
+# Minimal, clean styling
+st.markdown(
+    """
 <style>
-/* --- Service pills (toggle buttons) --- */
-div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
-  border-radius: 999px;
-  padding: 0.35rem 0.75rem;
-  border: 1px solid rgba(49, 51, 63, 0.2);
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+html, body, [class*="st-"] {
+  font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-/* --- Chips for liked movies --- */
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.25rem 0.6rem;
-  border-radius: 999px;
-  border: 1px solid rgba(49, 51, 63, 0.18);
-  margin: 0.2rem 0.25rem 0.2rem 0;
+h1, h2, h3, h4 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+[data-testid="stMetricValue"] {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.section-card {
+  padding: 1.25rem 1.25rem 1rem 1.25rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.section-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.muted {
+  color: #64748b;
   font-size: 0.9rem;
-  background: rgba(49, 51, 63, 0.04);
 }
-.chip button {
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 1rem;
-  line-height: 1;
-  padding: 0;
+
+.tight hr {
+  margin: 0.75rem 0;
 }
-.small-muted { color: rgba(49,51,63,0.65); font-size: 0.9rem; }
+
+/* Streamlit input polish */
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextInput"] > label,
+div[data-testid="stNumberInput"] label,
+div[data-testid="stSelectbox"] label,
+div[data-testid="stMultiselect"] label,
+div[data-testid="stSlider"] label,
+div[data-testid="stTextArea"] label {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input,
+div[data-testid="stSelectbox"] div[role="combobox"],
+div[data-testid="stMultiselect"] div[role="combobox"] {
+  min-height: 42px;
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+}
+
+div[data-testid="stTextInput"] input::placeholder {
+  color: #94a3b8;
+  opacity: 1;
+}
 </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """,
+    unsafe_allow_html=True,
+)
 
+st.title("FPL Optimizer")
+st.caption("A guided, minimal workflow for squad loading, transfers, and optimization.")
 
-def service_pills(all_services: List[str], selected: Set[str]) -> Set[str]:
-    """
-    Render services as pill-style toggle buttons. Returns updated selection.
-    """
-    st.write("Streaming services")
-    cols = st.columns(4)
-    updated = set(selected)
+# Shared state
+st.session_state.setdefault("squad_ids", None)
+st.session_state.setdefault("squad_df", None)
+st.session_state.setdefault("transfer_df", None)
+st.session_state.setdefault("entry_error", None)
+st.session_state.setdefault("gw_used_for_picks", None)
 
-    for i, s in enumerate(all_services):
-        with cols[i % 4]:
-            is_on = s in updated
-            label = f"✅ {s}" if is_on else s
-            if st.button(label, key=f"svc_{s}", type="secondary"):
-                if is_on:
-                    updated.remove(s)
-                else:
-                    updated.add(s)
-    return updated
+# Global settings state
+st.session_state.setdefault("risk_mode", "Balanced")
+st.session_state.setdefault("bench_weight", 0.10)
+st.session_state.setdefault("fixture_horizon", 3)
+st.session_state.setdefault("n_matches_std", 6)
 
+elements = load_bootstrap()
 
-def render_like_chips(titles: List[str]) -> None:
-    """
-    Show liked titles as chips with remove buttons.
-    """
-    if not titles:
-        st.markdown('<div class="small-muted">No “like” movies added yet.</div>', unsafe_allow_html=True)
-        return
-
-    # Render chips in rows (simple approach)
-    for t in titles:
-        c1, c2 = st.columns([10, 1])
-        with c1:
-            st.markdown(f'<span class="chip">{t}</span>', unsafe_allow_html=True)
-        with c2:
-            if st.button("✕", key=f"rm_{t}"):
-                st.session_state.like_titles = [x for x in st.session_state.like_titles if x != t]
-                st.rerun()
-
-
-# ----------------------------
-# Recommendation model
-# ----------------------------
-@dataclass
-class Rec:
-    tmdb_id: int
-    title: str
-    year: Optional[int]
-    overview: str
-    poster_url: Optional[str]
-    tmdb_vote: Optional[float]
-    imdb_rating: Optional[float]
-    score: float
-
-
-def build_rec(movie: dict, like_bonus: float = 0.0) -> Optional[Rec]:
-    tmdb_id = movie.get("id")
-    title = movie.get("title") or ""
-    if not tmdb_id or not title:
-        return None
-
-    release_date = movie.get("release_date") or ""
-    year = int(release_date[:4]) if release_date[:4].isdigit() else None
-    overview = movie.get("overview") or ""
-    poster_path = movie.get("poster_path")
-    poster_url = f"{TMDB_IMG}{poster_path}" if poster_path else None
-    tmdb_vote = movie.get("vote_average")
-
-    imdb_rating = None
-    if OMDB_API_KEY:
-        ext = tmdb_movie_external_ids(tmdb_id)
-        imdb_id = ext.get("imdb_id")
-        if imdb_id:
-            om = omdb_lookup(imdb_id)
-            imdb_rating = safe_float(om.get("imdbRating"))
-
-    base = float(tmdb_vote or 0.0)
-    quality = 0.25 if imdb_rating is not None else 0.0
-    score = base + like_bonus + quality
-
-    return Rec(
-        tmdb_id=tmdb_id,
-        title=title,
-        year=year,
-        overview=overview,
-        poster_url=poster_url,
-        tmdb_vote=tmdb_vote,
-        imdb_rating=imdb_rating,
-        score=score,
-    )
-
-
-# ----------------------------
-# App
-# ----------------------------
-st.set_page_config(page_title="What should I watch?", page_icon="🎬", layout="wide")
-inject_styles()
-
-st.title("🎬 What should I watch?")
-st.caption("Choose services + genre + scores, add a few movies you like, and get ranked picks.")
-
-
-# Session state setup
-if "like_titles" not in st.session_state:
-    st.session_state.like_titles = []
-if "selected_services" not in st.session_state:
-    st.session_state.selected_services = {"Netflix", "Prime Video"}
-
-
+# Sidebar: Global settings
 with st.sidebar:
-    st.header("Filters")
-    region = st.selectbox("Region", REGIONS, index=0)
+    st.header("Model settings")
+    st.caption("These apply everywhere.")
 
-    # Services as pills
-    st.session_state.selected_services = service_pills(
-        list(PROVIDER_NAME_TO_ID.keys()),
-        st.session_state.selected_services,
-    )
+    st.selectbox("Risk mode", ["Safe", "Balanced", "Aggro"], index=1, key="risk_mode")
+    st.slider("Bench importance", 0.0, 0.3, 0.10, 0.01, key="bench_weight")
+    st.slider("Fixture horizon (GWs)", 1, 6, 3, 1, key="fixture_horizon")
+    st.slider("Volatility lookback (matches)", 4, 10, 6, 1, key="n_matches_std")
 
-    genre = st.selectbox("Genre", options=["(Any)"] + list(GENRES.keys()), index=0)
-    genre_id = None if genre == "(Any)" else GENRES[genre]
+# Pull global settings
+risk_mode = st.session_state.risk_mode
+bench_weight = float(st.session_state.bench_weight)
+fixture_horizon = int(st.session_state.fixture_horizon)
+n_matches_std = int(st.session_state.n_matches_std)
 
-    st.subheader("Score sliders")
-    imdb_min = st.slider("IMDb minimum", 0.0, 10.0, 6.5, 0.1)
+# ---- Separate GW for stats vs fixtures ----
+gw_stats, gw_fixtures = get_gw_stats_and_fixtures()  # fixtures start at gw_stats + 1
 
-    # UI-only by default (until you add a data source)
-    rt_min = st.slider("Rotten Tomatoes minimum (optional)", 0, 100, 60, 1)
-    lb_min = st.slider("Letterboxd minimum (optional)", 0.0, 5.0, 3.5, 0.1)
+fixtures = load_fixtures()
+team_diff, team_home_ratio, team_fixture_count = team_fixture_context_horizon(
+    fixtures, gw_start=gw_fixtures, horizon=fixture_horizon
+)
 
-    st.divider()
-    n_results = st.slider("How many recommendations?", 5, 30, 12, 1)
+# Global caption (visible above stepper)
+st.caption(
+    f"Stats reference: **GW{gw_stats}** • "
+    f"Fixture window: **GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1}**"
+)
 
-# Like movies tag UI
-st.subheader("Movies you like (tags)")
-cA, cB = st.columns([3, 1])
-with cA:
-    new_like = st.text_input("Add a movie", placeholder="e.g., Heat", label_visibility="collapsed")
-with cB:
-    if st.button("Add", type="secondary"):
-        t = (new_like or "").strip()
-        if t and t not in st.session_state.like_titles:
-            st.session_state.like_titles.append(t)
-            st.rerun()
+step = st.radio(
+    "Workflow",
+    ["1. Load team", "2. Transfers", "3. Optimize", "4. Top players", "5. Assumptions"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
-render_like_chips(st.session_state.like_titles)
+# -------------------- STEP 1: Load team --------------------
+if step == "1. Load team":
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
 
-st.divider()
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Load your squad</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Paste your Entry ID or URL to auto-load your 15 players.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-go = st.button("Recommend 🍿", type="primary")
+    left, right = st.columns([1, 2], gap="large")
 
+    with left:
+        st.markdown("**Team ID (Entry ID)**")
 
-if go:
-    selected_services = st.session_state.selected_services
-    selected_provider_ids = {PROVIDER_NAME_TO_ID[s] for s in selected_services}
+        with st.expander("How to find your Team ID", expanded=False):
+            st.markdown(
+                """
+**Method 1: copy it from the URL**
+1. Open the Fantasy Premier League website and log in.
+2. Go to **Points** (or **Pick Team**) for your squad.
+3. Look at your browser address bar — your URL will include `/entry/<NUMBER>/`.
 
-    rec_pool: Dict[int, Rec] = {}
+**Generic formats**
+- `https://fantasy.premierleague.com/entry/<ENTRY_ID>/event/<GW>/points`
+- `https://fantasy.premierleague.com/entry/<ENTRY_ID>/`
 
-    with st.spinner("Building recommendations..."):
-        # 1) Personalized from likes
-        liked_tmdb_ids: List[int] = []
-        for t in st.session_state.like_titles:
-            hit = tmdb_search_movie(t)
-            if hit:
-                liked_tmdb_ids.append(hit["id"])
+**Example**
+- If you see: `.../entry/1234567/event/22/points`
+- Then your Team ID is: **1234567**
+                """
+            )
 
-        for mid in liked_tmdb_ids:
-            for m in tmdb_recommendations(mid, pages=2):
-                r = build_rec(m, like_bonus=1.25)
-                if not r:
-                    continue
-                if r.tmdb_id not in rec_pool or r.score > rec_pool[r.tmdb_id].score:
-                    rec_pool[r.tmdb_id] = r
+        entry_id = st.text_input("FPL Team ID", value="", placeholder="e.g., 1234567")
 
-        # 2) Broad discover (fills gaps)
-        for m in tmdb_discover_movies(region=region, genre_id=genre_id, provider_ids=list(selected_provider_ids), pages=3):
-            r = build_rec(m, like_bonus=0.0)
-            if not r:
-                continue
-            if r.tmdb_id not in rec_pool or r.score > rec_pool[r.tmdb_id].score:
-                rec_pool[r.tmdb_id] = r
+        url_paste = st.text_input(
+            "Or paste your FPL URL here (optional)",
+            value="",
+            placeholder="https://fantasy.premierleague.com/entry/1234567/event/22/points"
+        )
+        if url_paste.strip():
+            m = re.search(r"/entry/(\d+)", url_paste)
+            if m:
+                entry_id = m.group(1)
+                st.success(f"Found Team ID: {entry_id}")
+            else:
+                st.warning("Couldn’t find `/entry/<number>/` in that URL. Try copying the Points page URL.")
 
-        # 3) Filter
-        filtered: List[Rec] = []
-        for r in rec_pool.values():
-            # Best-effort: enforce service availability using TMDB providers
-            if not movie_available_on_selected_services(r.tmdb_id, region, selected_provider_ids):
-                continue
+        load_team = st.button("Load my squad", type="primary")
+        if load_team:
+            try:
+                if not entry_id.strip().isdigit():
+                    raise ValueError("Please enter a numeric Team ID (Entry ID).")
 
-            # IMDb min: enforce only if we have an IMDb rating
-            if OMDB_API_KEY and r.imdb_rating is not None and r.imdb_rating < imdb_min:
-                continue
+                # Try last finished GW first (usually exists), then upcoming anchor GW
+                prefill_ids, gw_used = load_entry_picks_with_fallback(
+                    int(entry_id.strip()),
+                    gw_try_1=gw_stats,
+                    gw_try_2=gw_fixtures
+                )
+                st.session_state.gw_used_for_picks = gw_used
+                st.session_state.squad_ids = prefill_ids
+                st.session_state.entry_error = None
+                st.session_state.transfer_df = None
+            except Exception as e:
+                st.session_state.entry_error = str(e)
 
-            filtered.append(r)
+        if st.session_state.entry_error:
+            st.error(st.session_state.entry_error)
 
-        filtered.sort(key=lambda x: x.score, reverse=True)
-        top = filtered[:n_results]
+    with right:
+        all_labels = elements["name"] + " — " + elements["team_name"] + " (" + elements["position"] + ")"
+        id_to_label = dict(zip(elements["player_id"], all_labels))
+        label_to_id = dict(zip(all_labels, elements["player_id"]))
 
-    if not top:
-        st.warning("No matches found. Try selecting fewer services or lowering the IMDb minimum.")
+        default_selected_labels = []
+        if st.session_state.squad_ids:
+            default_selected_labels = [id_to_label[i] for i in st.session_state.squad_ids if i in id_to_label]
+
+        selected = st.multiselect(
+            "Squad (auto-filled after loading)",
+            options=all_labels.tolist(),
+            default=default_selected_labels,
+            help="If your Team ID loads, your 15 players will appear here automatically.",
+        )
+
+        selected_ids = [label_to_id[s] for s in selected] if selected else (st.session_state.squad_ids or [])
+
+        if len(selected_ids) == 15:
+            st.session_state.squad_ids = selected_ids
+            squad_raw = elements[elements["player_id"].isin(selected_ids)].copy()
+            squad = add_fixture_adjusted_xpts(
+                squad_raw, team_diff, team_home_ratio, risk_mode, n_matches_std=n_matches_std
+            )
+            st.session_state.squad_df = squad
+            st.success("Squad loaded. Move to Transfers or Optimize.")
+            st.dataframe(
+                squad[[
+                    "name", "team_name", "position", "now_cost", "status",
+                    "avg_fixture_difficulty", "fixture_mult",
+                    "floor_points", "exp_points", "ceiling_points"
+                ]].sort_values(["position", "exp_points"], ascending=[True, False]),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.session_state.squad_df = None
+            if st.session_state.squad_ids and len(st.session_state.squad_ids) != 15:
+                st.info("Loaded squad is incomplete. Try re-loading via Team ID.")
+            elif selected and len(selected_ids) != 15:
+                st.info(f"Squad must contain exactly 15 players. Currently: {len(selected_ids)}")
+            else:
+                st.info("Enter your Team ID and click Load my squad to populate your 15 players.")
+
+# -------------------- STEP 2: Transfers --------------------
+if step == "2. Transfers":
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Transfer recommendations</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Lineup-aware 1-transfer moves, re-optimized after each swap.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    squad = st.session_state.squad_df
+    if squad is None or len(squad) == 0:
+        st.info("Load your squad in Step 1 first.")
     else:
-        st.success(f"Top {len(top)} picks based on your filters.")
+        colA, colB, colC = st.columns([1, 1, 2], gap="large")
 
-        for r in top:
-            cols = st.columns([1, 3, 2])
+        with colA:
+            bank_m = st.slider("Money in the bank (£m)", 0.0, 10.0, 1.0, 0.1, key="bank_m")
+            st.caption("Budget available in addition to the sell price.")
 
-            with cols[0]:
-                if r.poster_url:
-                    st.image(r.poster_url)
-                else:
-                    st.write("🖼️ No poster")
+        with colB:
+            optimize_target = st.selectbox(
+                "Optimize for",
+                ["Auto (from risk mode)", "Floor (safe)", "Mean", "Ceiling (upside)"],
+                index=0,
+                key="opt_target"
+            )
+            st.caption("Floor = safer returns; Ceiling = haul-chasing; Mean = average expectation.")
 
-            with cols[1]:
-                title_line = f"**{r.title}**" + (f" ({r.year})" if r.year else "")
-                st.markdown(title_line)
-                if r.overview:
-                    st.caption(r.overview[:220] + ("…" if len(r.overview) > 220 else ""))
+        with colC:
+            candidate_pool_size = st.slider("Transfer search breadth", 100, 450, 250, 25, key="cand_pool")
+            st.caption("Limits how many players we consider (keeps it fast).")
 
-                tmdb_txt = f"TMDB: {r.tmdb_vote:.1f}/10" if r.tmdb_vote is not None else "TMDB: n/a"
-                imdb_txt = f"IMDb: {r.imdb_rating:.1f}/10" if r.imdb_rating is not None else "IMDb: n/a"
-                st.write(f"{tmdb_txt} • {imdb_txt}")
-
-            with cols[2]:
-                st.markdown("**Links**")
-                st.link_button("IMDb (Google)", google_link(f"{r.title} imdb"))
-                if selected_services:
-                    # pick one (first) to keep it simple
-                    svc = sorted(list(selected_services))[0]
-                    st.link_button("Where to watch (Google)", google_link(f"{r.title} watch on {svc}"))
-                else:
-                    st.link_button("Where to watch (Google)", google_link(f"{r.title} where to watch"))
+        points_col = resolve_points_col(optimize_target, risk_mode)
+        lens_name = friendly_lens(points_col)
 
         st.caption(
-            "RT/Letterboxd sliders are UI placeholders until you connect a data source for those scores. "
-            "IMDb filtering is applied when OMDb is configured."
+            f"**Incremental expected points** = (optimized team after transfer) − (current optimized team), "
+            f"using the **{lens_name}** lens."
         )
-else:
-    st.info("Pick your services + genre, add a couple movies you like, then hit **Recommend 🍿**.")
+
+        run = st.button("Find best transfer", type="primary")
+        if run:
+            candidate_pool = elements.sort_values("points_per_game", ascending=False).head(candidate_pool_size).copy()
+            all_with_xp = add_fixture_adjusted_xpts(
+                candidate_pool, team_diff, team_home_ratio, risk_mode, n_matches_std=n_matches_std
+            )
+
+            bank_cost_tenths = int(round(bank_m * 10))
+            transfer_df = suggest_best_transfer_by_lineup(
+                squad=squad,
+                all_players_with_xp=all_with_xp,
+                bank_cost_tenths=bank_cost_tenths,
+                bench_weight=bench_weight,
+                points_col=points_col,
+                max_ins_per_out=20,
+                top_n_results=10
+            )
+            st.session_state.transfer_df = transfer_df
+
+        transfer_df = st.session_state.transfer_df
+        if transfer_df is not None:
+            if transfer_df.empty:
+                st.info("No positive-value transfers found within the constraints. Try increasing bank or changing the lens.")
+            else:
+                best = transfer_df.iloc[0]
+                st.markdown(
+                    f"**Best move:** Sell **{best['sell_player']}** → Buy **{best['buy_player']}** "
+                    f"(**{best['incremental_xPts']:+.2f} incremental expected points**)"
+                )
+                st.caption(
+                    f"Lens: **{best['lens']}** • Bank used £{best['bank_used_£m']:.1f}m • "
+                    f"New captain: {best['new_captain']} • New vice: {best['new_vice']}"
+                )
+
+                display_cols = [
+                    "sell_player", "sell_team", "sell_pos", "sell_cost_£m",
+                    "buy_player", "buy_team", "buy_cost_£m",
+                    "bank_used_£m",
+                    "incremental_xPts",
+                    "new_captain", "new_vice"
+                ]
+                shown = transfer_df[display_cols].copy()
+                shown["incremental_xPts"] = shown["incremental_xPts"].round(2)
+
+                st.dataframe(
+                    style_transfer_df(shown),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+# -------------------- STEP 3: Optimize & captaincy --------------------
+if step == "3. Optimize":
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Optimize XI + captaincy</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Best legal XI, bench, and captain for your chosen lens.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    squad = st.session_state.squad_df
+    if squad is None or len(squad) == 0:
+        st.info("Load your squad in Step 1 first.")
+    else:
+        left, right = st.columns([1, 2], gap="large")
+
+        with left:
+            optimize_target_opt = st.selectbox(
+                "Optimize for",
+                ["Auto (from risk mode)", "Floor (safe)", "Mean", "Ceiling (upside)"],
+                index=0,
+                key="opt_target_opt"
+            )
+            st.caption("Auto maps Safe→Floor, Balanced→Mean, Aggro→Ceiling.")
+            points_col_opt = resolve_points_col(optimize_target_opt, risk_mode)
+            st.caption(f"Optimizer is using **{friendly_lens(points_col_opt)}** (Risk mode: **{risk_mode}**).")
+
+            do_opt = st.button("Optimize lineup", type="primary")
+
+        if do_opt:
+            starters, bench, captain, vice = optimize_lineup(
+                squad, bench_weight=bench_weight, points_col=points_col_opt
+            )
+
+            starter_points = float(starters[points_col_opt].sum())
+            bench_points = float(bench[points_col_opt].sum())
+            total = starter_points + bench_weight * bench_points + float(captain[points_col_opt])
+
+            with right:
+                st.markdown("### Starting XI")
+                st.dataframe(
+                    starters[[
+                        "name", "team_name", "position", "status",
+                        "floor_points", "exp_points", "ceiling_points"
+                    ]].sort_values(["position", points_col_opt], ascending=[True, False]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.markdown("### Bench (best first)")
+                st.dataframe(
+                    bench[[
+                        "name", "team_name", "position", "status",
+                        "floor_points", "exp_points", "ceiling_points"
+                    ]].sort_values(points_col_opt, ascending=False),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.markdown("### Captaincy")
+                st.metric("Captain", f"{captain['name']} ({captain['team_name']})", f"{float(captain[points_col_opt]):.2f}")
+                st.metric("Vice", f"{vice['name']} ({vice['team_name']})", f"{float(vice[points_col_opt]):.2f}")
+
+                st.markdown("### Objective score")
+                st.write(f"Starters: **{starter_points:.2f}**")
+                st.write(f"Bench (weighted): **{bench_weight * bench_points:.2f}**")
+                st.write(f"Captain bonus: **{float(captain[points_col_opt]):.2f}**")
+                st.write(f"**Total:** **{total:.2f}**")
+
+        st.divider()
+        st.markdown("**Squad overview**")
+        st.caption("Sanity-check safety vs upside and fixture impact.")
+        st.dataframe(
+            squad[[
+                "name", "team_name", "position", "now_cost", "status",
+                "avg_fixture_difficulty", "fixture_mult",
+                "floor_points", "exp_points", "ceiling_points"
+            ]].sort_values(["position", "exp_points"], ascending=[True, False]),
+            use_container_width=True,
+            hide_index=True
+        )
+
+# -------------------- STEP 4: Top Players (by position) --------------------
+if step == "4. Top players":
+    settings_summary(risk_mode, fixture_horizon, bench_weight, n_matches_std)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Top players by position</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">Mean expected points over your fixture horizon (fast view).</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Keeping this fast: mean-only over full player pool
+    all_mean = add_fixture_adjusted_mean_only(elements, team_diff, team_home_ratio, risk_mode)
+
+    col1, col2, col3 = st.columns([1, 1, 2], gap="large")
+    with col1:
+        min_minutes = st.slider("Min minutes played", 0, 2000, 0, 100)
+        st.caption("Filter out players with tiny samples (optional).")
+    with col2:
+        only_available = st.checkbox("Only likely available", value=True)
+        st.caption("Removes i/s/u and doubtful players.")
+    with col3:
+        per_pos_n = st.slider("How many per position", 5, 10, 5, 1)
+        st.caption("Top N for each of GK/DEF/MID/FWD.")
+
+    df = all_mean.copy()
+    if min_minutes > 0:
+        df = df[df["minutes"].fillna(0) >= min_minutes]
+
+    if only_available:
+        df = df[~df["status"].isin(["i", "s", "u", "d"])]
+
+    df["cost_£m"] = (df["now_cost"] / 10.0).round(1)
+    df["exp_points"] = df["exp_points"].round(2)
+    df["avg_fixture_difficulty"] = df["avg_fixture_difficulty"].round(2)
+    df["fixture_mult"] = df["fixture_mult"].round(3)
+
+    # Render per-position tables
+    for pos in POS_ORDER:
+        sub = df[df["position"] == pos].sort_values("exp_points", ascending=False).head(per_pos_n).copy()
+        st.markdown(f"### {pos}")
+        if sub.empty:
+            st.info("No players matched your filters.")
+            continue
+
+        st.dataframe(
+            sub[[
+                "name", "team_name", "position", "cost_£m", "status",
+                "avg_fixture_difficulty", "fixture_mult",
+                "exp_points"
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+# -------------------- STEP 5: Assumptions --------------------
+if step == "5. Assumptions":
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Projection assumptions</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="muted">A plain-language summary of how expected points are computed.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### Base expectation (per player)")
+    st.markdown(
+        """
+- **Base points** = blend of long-run PPG and recent form (last ~5 in FPL data).
+- **Risk blend (Safe)**: 75% PPG + 25% Form
+- **Risk blend (Balanced)**: 68% PPG + 32% Form
+- **Risk blend (Aggro)**: 60% PPG + 40% Form
+- **Minutes reliability**: `minutes_factor = clamp(minutes / 1800, 0.3..1.0)`
+- **Availability**: uses FPL chance-of-playing; Safe weights it more, Aggro less.
+- **Status penalty**: i/s/u → ×0.25, d → ×0.75
+        """
+    )
+
+    st.markdown("### Fixture adjustments")
+    st.markdown(
+        f"""
+- **Fixture horizon**: next **{fixture_horizon} GWs** (GW{gw_fixtures}–GW{gw_fixtures + fixture_horizon - 1})
+- **Difficulty multiplier**: linear base around difficulty=3 with a gentle nonlinear kicker (capped `0.82` to `1.18`).
+- **Home/away balance**: small conservative adjustment based on % of home fixtures in the horizon (range `0.96` to `1.04`).
+        """
+    )
+
+    st.markdown("### Default settings")
+    st.markdown(
+        f"""
+- Risk mode: **{risk_mode}**
+- Bench importance: **{bench_weight:.2f}**
+- Volatility lookback: **{n_matches_std} matches**
+        """
+    )
